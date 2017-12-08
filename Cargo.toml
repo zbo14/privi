@@ -1,0 +1,8 @@
+[package]
+name = "rustle"
+version = "0.1.0"
+authors = ["Zachary Balder"]
+
+[dependencies]
+byteorder = "1.2.1"
+sodiumoxide = "0.0.16"
