@@ -93,21 +93,23 @@ pub struct Job {
 	key: secretbox::xsalsa20poly1305::Key,
 	nonce: secretbox::xsalsa20poly1305::Nonce,
 	op: u8,
+	tx: Sender<(Vec<u8>,usize)>,
 }
 
 impl Job {
-	pub fn new(bytes: &[u8], idx: usize, key: &secretbox::xsalsa20poly1305::Key, nonce: &secretbox::xsalsa20poly1305::Nonce, op: u8) -> Job {
+	pub fn new(bytes: &[u8], idx: usize, key: &secretbox::xsalsa20poly1305::Key, nonce: &secretbox::xsalsa20poly1305::Nonce, op: u8, tx: Sender<(Vec<u8>, usize)>) -> Job {
 		Job {
 			bytes: bytes.to_owned(),
 			idx,
 			key: key.clone(),
 			nonce: nonce.clone(),
 			op,
+			tx,
 		}
 	}
 }
 
-// ThreadPool adapted from https://doc.rust-lang.org/book/second-edition/ch20-04-storing-threads.html 
+// 	ThreadPool adapted from https://doc.rust-lang.org/book/second-edition/ch20-04-storing-threads.html 
 //
 //	---------------- BEGIN LICENSE ----------------
 //
@@ -136,7 +138,6 @@ impl Job {
 #[derive(Debug)]
 pub struct Pool {
 	// running: AtomicBool,
-	rx: Receiver<(Vec<u8>,usize)>,
 	tx: Sender<Job>,
 	workers: Vec<Worker>
 }
@@ -145,26 +146,24 @@ impl Pool {
 
 	pub fn new(size: usize) -> Pool {
 		// let running = ATOMIC_BOOL_INIT;
-		let (tx1, rx1) = channel();
-		let (tx2, rx2) = channel();
-		let rx1 = Arc::new(Mutex::new(rx1));
+		let (tx, rx) = channel();
+		let rx = Arc::new(Mutex::new(rx));
 		let mut workers = Vec::with_capacity(size);
 		for id in 0..size {
-			workers.push(Worker::new(id, rx1.clone(), tx2.clone()));
+			workers.push(Worker::new(id, rx.clone()));
 		}
 		Pool{
-			rx: rx2,
-			tx: tx1,
+			tx,
 			workers,
 		}
 	}
 
-	pub fn recv(&self) -> Result<(Vec<u8>,usize),String> {
-		self.rx.recv().map_err(|err| err.to_string())
+	pub fn send(job: Job, sender: &Sender<Job>) -> Result<(),String> {
+		sender.send(job).map_err(|err| err.to_string())
 	}
 
-	pub fn send(&self, job: Job) -> Result<(),String> {
-		self.tx.send(job).map_err(|err| err.to_string())
+	pub fn sender(&self) -> Sender<Job> {
+		self.tx.clone()
 	}
 }
 
@@ -175,17 +174,17 @@ pub struct Worker {
 }
 
 impl Worker {
-	pub fn new(id: usize, rx: Arc<Mutex<Receiver<Job>>>, tx: Sender<(Vec<u8>,usize)>) -> Worker {
+	pub fn new(id: usize, rx: Arc<Mutex<Receiver<Job>>>) -> Worker {
 		let thread = thread::spawn(move || {
 			loop {
 				if let Ok(lock) = rx.lock() {
 					if let Ok(job) = lock.recv() {
 						if job.op == DECRYPT {
 							let decrypted = secretbox::open(&job.bytes, &job.nonce, &job.key).unwrap();
-							tx.send((decrypted, job.idx)).unwrap();	
+							job.tx.send((decrypted, job.idx)).unwrap();	
 						} else if job.op == ENCRYPT {
 							let encrypted = secretbox::seal(&job.bytes, &job.nonce, &job.key);
-							tx.send((encrypted, job.idx)).unwrap();	
+							job.tx.send((encrypted, job.idx)).unwrap();	
 						}
 					}
 				}
@@ -204,11 +203,13 @@ const DECRYPT : u8 = 0x01;
 const ENCRYPT : u8 = 0x02;
 
 #[derive(Debug)]
-pub struct Pipe<'a, T: Read + Write + 'a, U: Read + Write + 'a>{
+pub struct Pipe<'a, T: Read + Write + 'a, U: Read + Write + 'a> {
 	dest: &'a mut U,
-	pool: Pool,
+	pool: &'a Pool,
 	pre_key: &'a box_::PrecomputedKey,
+	rx: Receiver<(Vec<u8>,usize)>,
 	source: &'a mut T,
+	tx: Sender<(Vec<u8>,usize)>,
 }
 
 macro_rules! vecvec {
@@ -240,17 +241,19 @@ impl<'a, T: Read + Write + 'a, U: Read + Write + 'a> Write for Pipe<'a, T, U> {
 
 impl<'a, T: Read + Write + 'a, U: Read + Write + 'a> Pipe<'a, T, U> {
 
-	pub fn default(pre_key: &'a box_::curve25519xsalsa20poly1305::PrecomputedKey, source: &'a mut T, dest: &'a mut U) -> Pipe<'a,T,U> {
-		Pipe::new(pre_key, source, dest, DEFAULT_POOL_SIZE)
+	pub fn default(pool: &'a Pool, pre_key: &'a box_::curve25519xsalsa20poly1305::PrecomputedKey, source: &'a mut T, dest: &'a mut U) -> Pipe<'a,T,U> {
+		Pipe::new(pool, pre_key, source, dest)
 	}
 
-	pub fn new(pre_key: &'a box_::curve25519xsalsa20poly1305::PrecomputedKey, source: &'a mut T, dest: &'a mut U, pool_size: usize) -> Pipe<'a,T,U> {
-		let pool = Pool::new(pool_size);
+	pub fn new(pool: &'a Pool, pre_key: &'a box_::curve25519xsalsa20poly1305::PrecomputedKey, source: &'a mut T, dest: &'a mut U) -> Pipe<'a,T,U> {
+		let (tx, rx) = channel();
 		Pipe{
 			dest, 
 			pool,
 			pre_key,
+			rx,
 			source,
+			tx,
 		}
 	}
 
@@ -281,16 +284,19 @@ impl<'a, T: Read + Write + 'a, U: Read + Write + 'a> Pipe<'a, T, U> {
 		let mut frame = vec![0u8; header.frame_size as usize];
 		let mut idx = 0;
 		let mut size_left = header.encrypted_size;
+		let sender = self.pool.sender();
 		while size_left > header.frame_size {
 			self.source.read_exact(&mut frame).map_err(|err| err.to_string())?;
-			self.pool.send(Job::new(&frame, idx, &header.key, &header.nonce, DECRYPT))?;
+			let job = Job::new(&frame, idx, &header.key, &header.nonce, DECRYPT, self.tx.clone());
+			Pool::send(job, &sender)?;
 			idx += 1;
 			size_left -= header.frame_size;
 		}
 		if size_left > 0 {
 			frame.truncate(size_left as usize);
 			self.source.read_exact(&mut frame).map_err(|err| err.to_string())?;
-			self.pool.send(Job::new(&frame, idx, &header.key, &header.nonce, DECRYPT))?;
+			let job = Job::new(&frame, idx, &header.key, &header.nonce, DECRYPT, self.tx.clone());
+			Pool::send(job, &sender)?;
 		}
 		let mut chunks = vecvec![u8; header.num_frames as usize];
 		let mut next = 0;
@@ -299,7 +305,7 @@ impl<'a, T: Read + Write + 'a, U: Read + Write + 'a> Pipe<'a, T, U> {
 				self.dest.write_all(&chunks[next as usize]).map_err(|err| err.to_string())?;
 				next += 1;
 			}
-			let (decrypted, idx) = self.pool.recv()?;
+			let (decrypted, idx) = self.rx.recv().map_err(|err| err.to_string())?;
 			if idx == next as usize {
 				self.dest.write_all(&decrypted).map_err(|err| err.to_string())?;
 				next += 1;
@@ -318,16 +324,19 @@ impl<'a, T: Read + Write + 'a, U: Read + Write + 'a> Pipe<'a, T, U> {
 		let mut size_left = file_size;
 		header.encrypt(&self.pre_key, &mut self.dest).map_err(|err| err.to_string())?;
 		let mut idx = 0;
+		let sender = self.pool.sender();
 		while size_left > chunk_size {
 			self.source.read_exact(&mut chunk).map_err(|err| err.to_string())?;
-			self.pool.send(Job::new(&chunk, idx, &key, &nonce, ENCRYPT))?;
+			let job = Job::new(&chunk, idx, &key, &nonce, ENCRYPT, self.tx.clone());
+			Pool::send(job, &sender)?;
 			idx += 1;
 			size_left -= chunk_size;
 		} 
 		if size_left > 0 {
 			chunk.truncate(size_left as usize);
 			self.source.read_exact(&mut chunk).map_err(|err| err.to_string())?;
-			self.pool.send(Job::new(&chunk, idx, &key, &nonce, ENCRYPT))?;
+			let job = Job::new(&chunk, idx, &key, &nonce, ENCRYPT, self.tx.clone());
+			Pool::send(job, &sender)?;
 		}
 		let mut frames = vecvec![u8; header.num_frames as usize];
 		let mut next = 0;
@@ -336,7 +345,7 @@ impl<'a, T: Read + Write + 'a, U: Read + Write + 'a> Pipe<'a, T, U> {
 				self.dest.write_all(&frames[next as usize]).map_err(|err| err.to_string())?;
 				next += 1;
 			}
-			let (encrypted, idx) = self.pool.recv().map_err(|err| err.to_string())?;
+			let (encrypted, idx) = self.rx.recv().map_err(|err| err.to_string())?;
 			if idx == next as usize {
 				self.dest.write_all(&encrypted).map_err(|err| err.to_string())?;
 				next += 1;
@@ -398,15 +407,16 @@ mod test {
 		let mut source = File::open("./test.mp3").unwrap();
 		let meta = source.metadata().unwrap();
 		let file_size = meta.len() as u32;
+		let pool = Pool::new(DEFAULT_POOL_SIZE);
 		let mut dest1 = Cursor::new(Vec::new());
 		let mut dest2 = Cursor::new(Vec::new());
 
 		{
-			let mut pipe1 = Pipe::default(&pre_key, &mut source, &mut dest1);
+			let mut pipe1 = Pipe::default(&pool, &pre_key, &mut source, &mut dest1);
 			pipe1.encrypt(DEFAULT_CHUNK_SIZE, file_size, "audio/mp3".to_owned()).unwrap();
 			pipe1.dest.set_position(0);
 
-			let mut pipe2 = Pipe::default(&pre_key, &mut pipe1, &mut dest2);
+			let mut pipe2 = Pipe::default(&pool, &pre_key, &mut pipe1, &mut dest2);
 			pipe2.decrypt().unwrap();
 			pipe2.dest.set_position(0);
 		}	
