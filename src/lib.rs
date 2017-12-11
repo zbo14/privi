@@ -3,6 +3,7 @@ extern crate sodiumoxide;
 
 use std::io::{Cursor,Error,Read,Write};
 use std::sync::{Arc,Mutex};
+use std::sync::atomic::{ATOMIC_BOOL_INIT, AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver,Sender,channel};
 use std::thread;
 
@@ -141,24 +142,25 @@ impl Job {
 
 #[derive(Debug)]
 pub struct Pool {
-	// running: AtomicBool,
+	running: Arc<AtomicBool>,
+	rx: Arc<Mutex<Receiver<Job>>>,
+	size: usize,
 	tx: Sender<Job>,
-	workers: Vec<Worker>
+	workers: Vec<Worker>,
 }
 
 impl Pool {
 
 	pub fn new(size: usize) -> Pool {
-		// let running = ATOMIC_BOOL_INIT;
+		let running = Arc::new(ATOMIC_BOOL_INIT);
 		let (tx, rx) = channel();
 		let rx = Arc::new(Mutex::new(rx));
-		let mut workers = Vec::with_capacity(size);
-		for id in 0..size {
-			workers.push(Worker::new(id, rx.clone()));
-		}
 		Pool{
+			running,
+			rx,
+			size,
 			tx,
-			workers,
+			workers: Vec::new(),
 		}
 	}
 
@@ -169,18 +171,38 @@ impl Pool {
 	pub fn sender(&self) -> Sender<Job> {
 		self.tx.clone()
 	}
+
+	pub fn start(&mut self) -> Result<(),String> {
+		if self.running.compare_and_swap(false, true, Ordering::Relaxed) {
+			return Err("Pool is already running".to_owned())
+		}
+		self.workers = Vec::with_capacity(self.size);
+		for id in 0..self.size {
+			self.workers.push(Worker::new(id, self.running.clone(), self.rx.clone()));
+		}
+		Ok(())
+	}
+
+	pub fn stop(&self) -> Result<(),String> {
+		if !self.running.compare_and_swap(true, false, Ordering::Relaxed) {
+			Err("Pool is not running".to_owned())
+		} else {
+			Ok(())
+		}
+	}
 }
 
 #[derive(Debug)]
 pub struct Worker {
-	id: usize, 
+	id: usize,
 	thread: thread::JoinHandle<()>,
 }
 
 impl Worker {
-	pub fn new(id: usize, rx: Arc<Mutex<Receiver<Job>>>) -> Worker {
+	pub fn new(id: usize, running: Arc<AtomicBool>, rx: Arc<Mutex<Receiver<Job>>>) -> Worker {
 		let thread = thread::spawn(move || {
-			loop {
+			// println!("Starting thread {}...", id);
+			while running.load(Ordering::Relaxed) {
 				if let Ok(lock) = rx.lock() {
 					if let Ok(job) = lock.recv() {
 						if job.op == DECRYPT {
@@ -193,6 +215,7 @@ impl Worker {
 					}
 				}
 			}
+			// println!("Stopping thread {}...", id);
 		});
 		Worker{
 			id,
@@ -201,7 +224,7 @@ impl Worker {
 	}
 }
 
-//	---------------- END LICENSE ----------------
+//	----------------- END LICENSE -----------------
 
 const DECRYPT : u8 = 0x01;
 const ENCRYPT : u8 = 0x02;
@@ -418,11 +441,16 @@ mod test {
 
 	#[test]
 	fn test_pipe() {
+
 		let (pre_key, _, _) = box_keys();
+
 		let mut source = File::open("./test.mp3").unwrap();
 		let meta = source.metadata().unwrap();
 		let file_size = meta.len() as u32;
-		let pool = Pool::new(DEFAULT_POOL_SIZE);
+
+		let mut pool = Pool::new(DEFAULT_POOL_SIZE);
+		assert!(pool.start().is_ok());
+
 		let mut dest1 = Cursor::new(Vec::new());
 		let mut dest2 = Cursor::new(Vec::new());
 
@@ -441,16 +469,22 @@ mod test {
 		file.read_exact(&mut plain_bytes).unwrap();
 
 		assert_eq!(plain_bytes, dest2.into_inner());
+		assert!(pool.stop().is_ok());
 	}
 
 	#[test]
 	fn test_pipes() {
+
 		let (pre_key1, _, _) = box_keys();
 		let (pre_key2, _, _) = box_keys();
+
 		let mut source = File::open("./test.mp3").unwrap();
 		let meta = source.metadata().unwrap();
 		let file_size = meta.len() as u32;
-		let pool = Pool::new(DEFAULT_POOL_SIZE);
+
+		let mut pool = Pool::new(DEFAULT_POOL_SIZE);
+		assert!(pool.start().is_ok());
+
 		let mut dest1 = Cursor::new(Vec::new());
 		let mut dest2 = Cursor::new(Vec::new());
 		let mut dest3 = Cursor::new(Vec::new());
@@ -462,7 +496,8 @@ mod test {
 			pipe1.dest.set_position(0); 
 
 			let mut pipe2 = Pipe::default(&pool, &pre_key2, &mut pipe1, &mut dest2);
-			pipe2.encrypt(DEFAULT_CHUNK_SIZE, total_encrypted_size(DEFAULT_CHUNK_SIZE, file_size, "audio/mp3".to_owned()), "--".to_owned()).unwrap();
+			let size = total_encrypted_size(DEFAULT_CHUNK_SIZE, file_size, "audio/mp3".to_owned());
+			pipe2.encrypt(DEFAULT_CHUNK_SIZE, size, "--".to_owned()).unwrap();
 			pipe2.dest.set_position(0);
 
 			let mut pipe3 = Pipe::default(&pool, &pre_key2, &mut pipe2, &mut dest3);
@@ -479,5 +514,6 @@ mod test {
 		file.read_exact(&mut plain_bytes).unwrap();
 
 		assert_eq!(plain_bytes, dest4.into_inner());
+		assert!(pool.stop().is_ok());
 	}
 }
