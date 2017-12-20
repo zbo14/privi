@@ -3,7 +3,7 @@ extern crate sodiumoxide;
 
 use std::io::{Cursor,Error,Read,Write};
 use std::sync::{Arc,Mutex};
-use std::sync::atomic::{ATOMIC_BOOL_INIT, AtomicBool, Ordering};
+use std::sync::atomic::{ATOMIC_BOOL_INIT,AtomicBool,Ordering};
 use std::sync::mpsc::{Receiver,Sender,channel};
 use std::thread;
 
@@ -11,8 +11,11 @@ use self::byteorder::{BigEndian,ReadBytesExt,WriteBytesExt};
 use self::sodiumoxide::crypto::box_;
 use self::sodiumoxide::crypto::secretbox;
 
+const DECRYPT : u8 = 0x01;
+const ENCRYPT : u8 = 0x02;
+
 const DEFAULT_CHUNK_SIZE : u32 = 16384;
-const DEFAULT_POOL_SIZE : usize = 8;
+const DEFAULT_POOL_SIZE : usize = 8; // what should this be?
 
 #[derive(Debug,PartialEq)]
 pub struct Header {
@@ -151,6 +154,10 @@ pub struct Pool {
 
 impl Pool {
 
+	pub fn default() -> Pool {
+		Pool::new(DEFAULT_POOL_SIZE)
+	}
+
 	pub fn new(size: usize) -> Pool {
 		let running = Arc::new(ATOMIC_BOOL_INIT);
 		let (tx, rx) = channel();
@@ -225,9 +232,6 @@ impl Worker {
 }
 
 //	----------------- END LICENSE -----------------
-
-const DECRYPT : u8 = 0x01;
-const ENCRYPT : u8 = 0x02;
 
 #[derive(Debug)]
 pub struct Pipe<'a, T: Read + Write + 'a, U: Read + Write + 'a> {
@@ -388,17 +392,79 @@ impl<'a, T: Read + Write + 'a, U: Read + Write + 'a> Pipe<'a, T, U> {
 	}
 }
 
+mod example {
+
+	use super::*;
+
+	use std::fs::File;
+	use std::io::Cursor;
+
+	use self::sodiumoxide::crypto::box_::curve25519xsalsa20poly1305::{gen_keypair,precompute};
+
+	pub fn main() {
+
+		// Alice's key 
+		let (mut alice_pk, _) = gen_keypair();
+
+		// Bob's key
+		let (_, mut bob_sk) = gen_keypair();
+
+		// Precomputed key
+		let pre_key = precompute(&mut alice_pk, &mut bob_sk);
+
+		// Start thread pool
+		let mut pool = Pool::default();
+		pool.start().unwrap();
+
+		// Open file 
+		let mut source = File::open("test.mp3").unwrap();
+
+		// File mimetype and size 
+		let file_size = source.metadata().unwrap().len() as u32;
+		let mime = "audio/mp3".to_owned();
+
+		// Destinations
+		let mut dest1 = Cursor::new(Vec::new());
+		let mut dest2 = Cursor::new(Vec::new());
+
+		{
+			// Encrypt 
+			let mut pipe1 = Pipe::default(&pool, &pre_key, &mut source, &mut dest1);
+			pipe1.encrypt(DEFAULT_CHUNK_SIZE, file_size, mime).unwrap();
+			pipe1.dest.set_position(0);
+
+			// Decrypt
+			let mut pipe2 = Pipe::default(&pool, &pre_key, &mut pipe1, &mut dest2);
+			pipe2.decrypt().unwrap();
+			pipe2.dest.set_position(0);
+		}
+
+		// Read plain bytes into vector
+		let mut file = File::open("./test.mp3").unwrap();
+		let mut plain_bytes = vec![0u8; file_size as usize];
+		file.read_exact(&mut plain_bytes).unwrap();
+
+		// Compare decrypted bytes to plain bytes
+		let decrypted_bytes = dest2.into_inner();
+		assert_eq!(plain_bytes, decrypted_bytes);
+
+		// Stop thread pool
+		pool.stop().unwrap();
+	}
+}
+
 #[cfg(test)]
 mod test {
 
 	use super::*;
 	use std::fs::File;
 
-	fn box_keys() -> (box_::curve25519xsalsa20poly1305::PrecomputedKey, box_::curve25519xsalsa20poly1305::PublicKey, box_::curve25519xsalsa20poly1305::SecretKey) {
+	const ALTERNATE_CHUNK_SIZE : u32 = 32768;
+
+	fn precompute_key() -> box_::curve25519xsalsa20poly1305::PrecomputedKey {
 		let (mut pub_key, _) = box_::curve25519xsalsa20poly1305::gen_keypair();
 		let (_, mut sec_key) = box_::curve25519xsalsa20poly1305::gen_keypair();
-		let pre_key = box_::curve25519xsalsa20poly1305::precompute(&mut pub_key, &mut sec_key);
-		(pre_key, pub_key, sec_key)
+		box_::curve25519xsalsa20poly1305::precompute(&mut pub_key, &mut sec_key)
 	}
 
 	fn new_header(key: &secretbox::xsalsa20poly1305::Key, nonce: &secretbox::xsalsa20poly1305::Nonce) -> Header {
@@ -433,22 +499,21 @@ mod test {
 		assert_eq!(header, Header::decode(&mut rw).unwrap());
 
 		let mut rw = Cursor::new(Vec::new());
-		let (pre_key, _, _) = box_keys();
+		let pre_key = precompute_key();
 		header.encrypt(&pre_key, &mut rw).unwrap();
 		rw.set_position(0);
 		assert_eq!(header, Header::decrypt(&pre_key, &mut rw).unwrap())
 	}
 
-	#[test]
-	fn test_pipe() {
+	fn test_pipe(chunk_size: u32) {
 
-		let (pre_key, _, _) = box_keys();
+		let pre_key = precompute_key();
 
 		let mut source = File::open("./test.mp3").unwrap();
 		let meta = source.metadata().unwrap();
 		let file_size = meta.len() as u32;
 
-		let mut pool = Pool::new(DEFAULT_POOL_SIZE);
+		let mut pool = Pool::default();
 		assert!(pool.start().is_ok());
 
 		let mut dest1 = Cursor::new(Vec::new());
@@ -456,7 +521,7 @@ mod test {
 
 		{
 			let mut pipe1 = Pipe::default(&pool, &pre_key, &mut source, &mut dest1);
-			pipe1.encrypt(DEFAULT_CHUNK_SIZE, file_size, "audio/mp3".to_owned()).unwrap();
+			pipe1.encrypt(chunk_size, file_size, "audio/mp3".to_owned()).unwrap();
 			pipe1.dest.set_position(0);
 
 			let mut pipe2 = Pipe::default(&pool, &pre_key, &mut pipe1, &mut dest2);
@@ -472,17 +537,16 @@ mod test {
 		assert!(pool.stop().is_ok());
 	}
 
-	#[test]
-	fn test_pipes() {
+	fn test_pipes(chunk_size_1: u32, chunk_size_2: u32) {
 
-		let (pre_key1, _, _) = box_keys();
-		let (pre_key2, _, _) = box_keys();
+		let pre_key1 = precompute_key();
+		let pre_key2 = precompute_key();
 
 		let mut source = File::open("./test.mp3").unwrap();
 		let meta = source.metadata().unwrap();
 		let file_size = meta.len() as u32;
 
-		let mut pool = Pool::new(DEFAULT_POOL_SIZE);
+		let mut pool = Pool::default();
 		assert!(pool.start().is_ok());
 
 		let mut dest1 = Cursor::new(Vec::new());
@@ -492,12 +556,12 @@ mod test {
 
 		{
 			let mut pipe1 = Pipe::default(&pool, &pre_key1, &mut source, &mut dest1);
-			pipe1.encrypt(DEFAULT_CHUNK_SIZE, file_size, "audio/mp3".to_owned()).unwrap();
+			pipe1.encrypt(chunk_size_1, file_size, "audio/mp3".to_owned()).unwrap();
 			pipe1.dest.set_position(0); 
 
 			let mut pipe2 = Pipe::default(&pool, &pre_key2, &mut pipe1, &mut dest2);
-			let size = total_encrypted_size(DEFAULT_CHUNK_SIZE, file_size, "audio/mp3".to_owned());
-			pipe2.encrypt(DEFAULT_CHUNK_SIZE, size, "--".to_owned()).unwrap();
+			let size = total_encrypted_size(chunk_size_1, file_size, "audio/mp3".to_owned());
+			pipe2.encrypt(chunk_size_2, size, String::new()).unwrap();
 			pipe2.dest.set_position(0);
 
 			let mut pipe3 = Pipe::default(&pool, &pre_key2, &mut pipe2, &mut dest3);
@@ -515,5 +579,30 @@ mod test {
 
 		assert_eq!(plain_bytes, dest4.into_inner());
 		assert!(pool.stop().is_ok());
+	}
+
+	#[test]
+	fn test_pipe_with_default_chunk_size() {
+		test_pipe(DEFAULT_CHUNK_SIZE)
+	}
+
+	#[test]
+	fn test_pipe_with_alternate_chunk_size() {
+		test_pipe(ALTERNATE_CHUNK_SIZE)
+	}
+
+	#[test]
+	fn test_pipes_with_default_chunk_size() {
+		test_pipes(DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE)
+	}
+
+	#[test]
+	fn test_pipes_with_different_chunk_sizes() {
+		test_pipes(DEFAULT_CHUNK_SIZE, ALTERNATE_CHUNK_SIZE)
+	}
+
+	#[test]
+	fn test_example() {
+		example::main()
 	}
 }
