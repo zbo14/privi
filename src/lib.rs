@@ -1,5 +1,8 @@
+// #![feature(test)]
+
 extern crate byteorder;
 extern crate sodiumoxide;
+extern crate test;
 
 use std::io::{Cursor,Error,Read,Write};
 use std::sync::{Arc,Mutex};
@@ -14,8 +17,8 @@ use self::sodiumoxide::crypto::secretbox;
 const DECRYPT : u8 = 0x01;
 const ENCRYPT : u8 = 0x02;
 
-const DEFAULT_CHUNK_SIZE : u32 = 16384;
-const DEFAULT_POOL_SIZE : usize = 8; // what should this be?
+pub const DEFAULT_CHUNK_SIZE : u32 = 16384;
+pub const DEFAULT_POOL_SIZE : usize = 4; // what should this be?
 
 #[derive(Debug,PartialEq)]
 pub struct Header {
@@ -29,7 +32,7 @@ pub struct Header {
 
 impl Header {
 
-	pub fn decode<R: Read>(r: &mut R) -> Result<Header,Error> {
+	fn decode<R: Read>(r: &mut R) -> Result<Header,Error> {
 		let encrypted_body_size = r.read_u32::<BigEndian>()?;
 		let frame_size = r.read_u32::<BigEndian>()?;
 		let mut key = [0u8; secretbox::xsalsa20poly1305::KEYBYTES];
@@ -53,7 +56,7 @@ impl Header {
 		})
 	}
 
-	pub fn decrypt<R: Read>(pre_key: &box_::PrecomputedKey, r: &mut R) -> Result<Header,Error> {
+	fn decrypt<R: Read>(pre_key: &box_::PrecomputedKey, r: &mut R) -> Result<Header,Error> {
 		let mut nonce = [0u8; box_::curve25519xsalsa20poly1305::NONCEBYTES];
 		r.read_exact(&mut nonce)?;
 		let nonce = box_::curve25519xsalsa20poly1305::Nonce::from_slice(&nonce).unwrap();
@@ -64,7 +67,7 @@ impl Header {
 		Header::decode(&mut Cursor::new(decrypted))
 	}
 
-	pub fn encode<W: Write>(&self, w: &mut W) -> Result<(),Error> {
+	fn encode<W: Write>(&self, w: &mut W) -> Result<(),Error> {
 		w.write_u32::<BigEndian>(self.encrypted_body_size)?;
 		w.write_u32::<BigEndian>(self.frame_size)?;
 		w.write_all(&self.key.0)?;
@@ -75,7 +78,7 @@ impl Header {
 		w.write_u32::<BigEndian>(self.num_frames)
 	}
 
-	pub fn encrypt<W: Write>(&self, pre_key: &box_::PrecomputedKey, w: &mut W) -> Result<(),Error> {
+	fn encrypt<W: Write>(&self, pre_key: &box_::PrecomputedKey, w: &mut W) -> Result<(),Error> {
 		let mut encoded = Vec::with_capacity(self.encoded_header_size());
 		self.encode(&mut encoded)?;
 		let nonce = box_::curve25519xsalsa20poly1305::gen_nonce();
@@ -85,7 +88,7 @@ impl Header {
 		w.write_all(&encrypted)
 	}
 
-	pub fn encoded_header_size(&self) -> usize {
+	fn encoded_header_size(&self) -> usize {
 		4 * 4 + secretbox::xsalsa20poly1305::KEYBYTES + secretbox::xsalsa20poly1305::NONCEBYTES + self.mime.as_bytes().len()
 	}
 
@@ -154,10 +157,6 @@ pub struct Pool {
 
 impl Pool {
 
-	pub fn default() -> Pool {
-		Pool::new(DEFAULT_POOL_SIZE)
-	}
-
 	pub fn new(size: usize) -> Pool {
 		let running = Arc::new(ATOMIC_BOOL_INIT);
 		let (tx, rx) = channel();
@@ -171,11 +170,11 @@ impl Pool {
 		}
 	}
 
-	pub fn send(job: Job, sender: &Sender<Job>) -> Result<(),String> {
+	fn send(job: Job, sender: &Sender<Job>) -> Result<(),String> {
 		sender.send(job).map_err(|err| err.to_string())
 	}
 
-	pub fn sender(&self) -> Sender<Job> {
+	fn sender(&self) -> Sender<Job> {
 		self.tx.clone()
 	}
 
@@ -206,18 +205,18 @@ pub struct Worker {
 }
 
 impl Worker {
-	pub fn new(id: usize, running: Arc<AtomicBool>, rx: Arc<Mutex<Receiver<Job>>>) -> Worker {
+	fn new(id: usize, running: Arc<AtomicBool>, rx: Arc<Mutex<Receiver<Job>>>) -> Worker {
 		let thread = thread::spawn(move || {
 			// println!("Starting thread {}...", id);
 			while running.load(Ordering::Relaxed) {
 				if let Ok(lock) = rx.lock() {
 					if let Ok(job) = lock.recv() {
 						if job.op == DECRYPT {
-							let decrypted = secretbox::open(&job.bytes, &job.nonce, &job.key).unwrap();
-							job.tx.send((decrypted, job.idx)).unwrap();	
+							let chunk = secretbox::open(&job.bytes, &job.nonce, &job.key).unwrap();
+							job.tx.send((chunk, job.idx)).unwrap();	
 						} else if job.op == ENCRYPT {
-							let encrypted = secretbox::seal(&job.bytes, &job.nonce, &job.key);
-							job.tx.send((encrypted, job.idx)).unwrap();	
+							let frame = secretbox::seal(&job.bytes, &job.nonce, &job.key);
+							job.tx.send((frame, job.idx)).unwrap();	
 						}
 					}
 				}
@@ -234,10 +233,10 @@ impl Worker {
 //	----------------- END LICENSE -----------------
 
 #[derive(Debug)]
-pub struct Pipe<'a, T: Read + Write + 'a, U: Read + Write + 'a> {
-	dest: &'a mut U,
+pub struct TPipe<'a, T: Read + Write + 'a, U: Read + Write> {
+	dest: Arc<Mutex<U>>,
 	pre_key: &'a box_::PrecomputedKey,
-	rx: Receiver<(Vec<u8>,usize)>,
+	rx: Arc<Mutex<Receiver<(Vec<u8>,usize)>>>,
 	sender: Sender<Job>,
 	source: &'a mut T,
 	tx: Sender<(Vec<u8>,usize)>,
@@ -253,13 +252,40 @@ macro_rules! vecvec {
     }};
 }
 
-impl<'a, T: Read + Write + 'a, U: Read + Write + 'a> Read for Pipe<'a, T, U> {
-	fn read(&mut self, buf: &mut [u8]) -> Result<usize,Error> {
-		self.dest.read(buf)
+pub fn encrypted_body_size(chunk_size: u32, file_size: u32) -> (u32,u32,u32) {
+	let overhead = secretbox::xsalsa20poly1305::MACBYTES as u32;
+	let encrypted_body_size;
+	let frame_size = chunk_size + overhead;
+	let mut num_frames = file_size / chunk_size;
+	let rem = file_size % chunk_size;
+	if rem == 0 {
+		encrypted_body_size = num_frames * frame_size;
+	} else {
+		encrypted_body_size = num_frames * frame_size + rem + overhead;
+		num_frames += 1;
+	}
+	(encrypted_body_size, frame_size, num_frames)
+}
+
+pub fn header(chunk_size: u32, file_size: u32, key: &secretbox::Key, mime: String, nonce: &secretbox::Nonce) -> Header {
+	let (encrypted_body_size, frame_size, num_frames) = encrypted_body_size(chunk_size, file_size);
+	Header{
+		encrypted_body_size,
+		frame_size,			
+		key: key.clone(),
+		mime,
+		nonce: nonce.clone(),
+		num_frames,
 	}
 }
 
-impl<'a, T: Read + Write + 'a, U: Read + Write + 'a> Write for Pipe<'a, T, U> {
+impl<'a, T: Read + Write + 'a, U: Read + Write> Read for TPipe<'a, T, U> {
+	fn read(&mut self, buf: &mut [u8]) -> Result<usize,Error> {
+		self.dest.lock().unwrap().read(buf)
+	}
+}
+
+impl<'a, T: Read + Write + 'a, U: Read + Write> Write for TPipe<'a, T, U> {
 
 	fn flush(&mut self) -> Result<(),Error> {
 		self.source.flush()
@@ -270,31 +296,14 @@ impl<'a, T: Read + Write + 'a, U: Read + Write + 'a> Write for Pipe<'a, T, U> {
 	}
 }
 
-impl<'a, T: Read + Write + 'a, U: Read + Write + 'a> Pipe<'a, T, U> {
+impl<'a, T: Read + Write + 'a, U: Send + Read + Write + 'static> TPipe<'a, T, U> {
 
-	pub fn default(pool: &'a Pool, pre_key: &'a box_::curve25519xsalsa20poly1305::PrecomputedKey, source: &'a mut T, dest: &'a mut U) -> Pipe<'a,T,U> {
-		Pipe::new(pool, pre_key, source, dest)
-	}
-
-	fn encrypted_body_size(chunk_size: u32, file_size: u32) -> (u32,u32,u32) {
-		let overhead = secretbox::xsalsa20poly1305::MACBYTES as u32;
-		let encrypted_body_size;
-		let frame_size = chunk_size + overhead;
-		let mut num_frames = file_size / chunk_size;
-		let rem = file_size % chunk_size;
-		if rem == 0 {
-			encrypted_body_size = num_frames * frame_size;
-		} else {
-			encrypted_body_size = num_frames * frame_size + rem + overhead;
-			num_frames += 1;
-		}
-		(encrypted_body_size, frame_size, num_frames)
-	}
-
-	pub fn new(pool: &'a Pool, pre_key: &'a box_::curve25519xsalsa20poly1305::PrecomputedKey, source: &'a mut T, dest: &'a mut U) -> Pipe<'a,T,U> {
+	pub fn new(pool: &'a Pool, pre_key: &'a box_::curve25519xsalsa20poly1305::PrecomputedKey, source: &'a mut T, dest: U) -> TPipe<'a,T,U> {
+		let dest = Arc::new(Mutex::new(dest));
 		let sender = pool.sender();
 		let (tx, rx) = channel();
-		Pipe{
+		let rx = Arc::new(Mutex::new(rx));
+		TPipe{
 			dest,
 			pre_key,
 			rx,
@@ -304,20 +313,31 @@ impl<'a, T: Read + Write + 'a, U: Read + Write + 'a> Pipe<'a, T, U> {
 		}
 	}
 
-	pub fn header(chunk_size: u32, file_size: u32, key: &secretbox::Key, mime: String, nonce: &secretbox::Nonce) -> Header {
-		let (encrypted_body_size, frame_size, num_frames) = Pipe::<T,U>::encrypted_body_size(chunk_size, file_size);
-		Header{
-			encrypted_body_size,
-			frame_size,			
-			key: key.clone(),
-			mime,
-			nonce: nonce.clone(),
-			num_frames,
-		}
-	}
-
 	pub fn decrypt(&mut self) -> Result<(),String> {
 		let header = Header::decrypt(&self.pre_key, self.source).map_err(|err| err.to_string())?;
+		let num_frames = header.num_frames;
+		let dest = self.dest.clone();
+		let rx = self.rx.clone();
+		let handle : thread::JoinHandle<Result<(),String>> = thread::spawn(move || {
+			let mut chunks = vecvec![u8; num_frames as usize];
+			let mut next = 0;
+			let mut dest = dest.lock().unwrap();
+			let rx = rx.lock().unwrap();
+			while next < num_frames {
+				if !chunks[next as usize].is_empty() {
+					dest.write_all(&chunks[next as usize]).map_err(|err| err.to_string())?;
+					next += 1;
+				}
+				let (chunk, idx) = rx.recv().unwrap();
+				if idx == next as usize {
+					dest.write_all(&chunk).map_err(|err| err.to_string())?;
+					next += 1;
+				} else {
+					chunks[idx as usize] = chunk;
+				}
+			}
+			Ok(())
+		});
 		let mut frame = vec![0u8; header.frame_size as usize];
 		let mut idx = 0;
 		let mut size_left = header.encrypted_body_size;
@@ -334,20 +354,106 @@ impl<'a, T: Read + Write + 'a, U: Read + Write + 'a> Pipe<'a, T, U> {
 			let job = Job::new(&frame, idx, &header.key, &header.nonce, DECRYPT, self.tx.clone());
 			Pool::send(job, &self.sender)?;
 		}
-		let mut chunks = vecvec![u8; header.num_frames as usize];
-		let mut next = 0;
-		while next < header.num_frames {
-			if !chunks[next as usize].is_empty() {
-				self.dest.write_all(&chunks[next as usize]).map_err(|err| err.to_string())?;
-				next += 1;
+		handle.join().unwrap()
+	}
+
+	pub fn encrypt(&mut self, chunk_size: u32, file_size: u32, mime: String) -> Result<(),String> {
+		let key = secretbox::gen_key();
+		let nonce = secretbox::gen_nonce();
+		let header = header(chunk_size, file_size, &key, mime, &nonce);
+		let dest = self.dest.clone();
+		let pre_key = self.pre_key.clone();
+		let rx = self.rx.clone();
+		let handle : thread::JoinHandle<Result<(),String>> = thread::spawn(move || {
+			let mut frames = vecvec![u8; header.num_frames as usize];
+			let mut next = 0;
+			let mut dest = dest.lock().unwrap();
+			let rx = rx.lock().unwrap();
+			header.encrypt(&pre_key, &mut *dest).map_err(|err| err.to_string())?;
+			while next < header.num_frames {
+				if !frames[next as usize].is_empty() {
+					dest.write_all(&frames[next as usize]).map_err(|err| err.to_string())?;
+					next += 1;
+				}
+				let (frame, idx) = rx.recv().unwrap();
+				if idx == next as usize {
+					dest.write_all(&frame).map_err(|err| err.to_string())?;
+					next += 1;
+				} else {
+					frames[idx as usize] = frame; 
+				}
 			}
-			let (decrypted, idx) = self.rx.recv().map_err(|err| err.to_string())?;
-			if idx == next as usize {
-				self.dest.write_all(&decrypted).map_err(|err| err.to_string())?;
-				next += 1;
-			} else {
-				chunks[idx as usize] = decrypted;
-			}
+			Ok(())
+		});
+		let mut chunk = vec![0u8; chunk_size as usize];
+		let mut idx = 0;
+		let mut size_left = file_size;
+		while size_left > chunk_size {
+			self.source.read_exact(&mut chunk).map_err(|err| err.to_string())?;
+			let job = Job::new(&chunk, idx, &key, &nonce, ENCRYPT, self.tx.clone());
+			Pool::send(job, &self.sender)?;
+			idx += 1;
+			size_left -= chunk_size;
+		}
+		if size_left > 0 {
+			chunk.truncate(size_left as usize);
+			self.source.read_exact(&mut chunk).map_err(|err| err.to_string())?;
+			let job = Job::new(&chunk, idx, &key, &nonce, ENCRYPT, self.tx.clone());
+			Pool::send(job, &self.sender)?;
+		}
+		handle.join().unwrap()
+	}
+}
+
+#[derive(Debug)]
+pub struct SPipe<'a, T: Read + Write + 'a, U: Read + Write + 'a> {
+	dest: &'a mut U,
+	pre_key: &'a box_::PrecomputedKey,
+	source: &'a mut T,
+}
+
+impl<'a, T: Read + Write + 'a, U: Read + Write + 'a> Read for SPipe<'a,T,U> {
+	fn read(&mut self, buf: &mut [u8]) -> Result<usize,Error> {
+		self.dest.read(buf)
+	}
+}
+
+impl<'a, T: Read + Write + 'a, U: Read + Write + 'a> Write for SPipe<'a,T,U> {
+	
+	fn flush(&mut self) -> Result<(),Error> {
+		self.source.flush()
+	}
+
+	fn write(&mut self, buf: &[u8]) -> Result<usize,Error> {
+		self.source.write(buf)
+	}
+}
+
+impl<'a, T: Read + Write + 'a, U: Read + Write + 'a> SPipe<'a,T,U> {
+	
+	pub fn new(pre_key: &'a box_::curve25519xsalsa20poly1305::PrecomputedKey, source: &'a mut T, dest: &'a mut U) -> SPipe<'a,T,U> {
+		SPipe{
+			dest,
+			pre_key,
+			source,
+		}
+	}
+
+	pub fn decrypt(&mut self) -> Result<(),String> {
+		let header = Header::decrypt(&self.pre_key, self.source).map_err(|err| err.to_string())?;
+		let mut frame = vec![0u8; header.frame_size as usize];
+		let mut size_left = header.encrypted_body_size;
+		while size_left > header.frame_size {
+			self.source.read_exact(&mut frame).map_err(|err| err.to_string())?;
+			let chunk = &secretbox::open(&frame, &header.nonce, &header.key).unwrap();
+			self.dest.write_all(&chunk).map_err(|err| err.to_string())?;
+			size_left -= header.frame_size;
+		}
+		if size_left > 0 {
+			frame.truncate(size_left as usize);
+			self.source.read_exact(&mut frame).map_err(|err| err.to_string())?;
+			let chunk = secretbox::open(&frame, &header.nonce, &header.key).unwrap();
+			self.dest.write_all(&chunk).map_err(|err| err.to_string())?;
 		}
 		Ok(())
 	}
@@ -356,37 +462,20 @@ impl<'a, T: Read + Write + 'a, U: Read + Write + 'a> Pipe<'a, T, U> {
 		let mut chunk = vec![0u8; chunk_size as usize];
 		let key = secretbox::gen_key();
 		let nonce = secretbox::gen_nonce();
-		let header = Pipe::<T,U>::header(chunk_size, file_size, &key, mime, &nonce);
+		let header = header(chunk_size, file_size, &key, mime, &nonce);
 		let mut size_left = file_size;
 		header.encrypt(&self.pre_key, &mut self.dest).map_err(|err| err.to_string())?;
-		let mut idx = 0;
 		while size_left > chunk_size {
 			self.source.read_exact(&mut chunk).map_err(|err| err.to_string())?;
-			let job = Job::new(&chunk, idx, &key, &nonce, ENCRYPT, self.tx.clone());
-			Pool::send(job, &self.sender)?;
-			idx += 1;
+			let frame = secretbox::seal(&chunk, &nonce, &key);
+			self.dest.write_all(&frame).map_err(|err| err.to_string())?;
 			size_left -= chunk_size;
 		} 
 		if size_left > 0 {
 			chunk.truncate(size_left as usize);
 			self.source.read_exact(&mut chunk).map_err(|err| err.to_string())?;
-			let job = Job::new(&chunk, idx, &key, &nonce, ENCRYPT, self.tx.clone());
-			Pool::send(job, &self.sender)?;
-		}
-		let mut frames = vecvec![u8; header.num_frames as usize];
-		let mut next = 0;
-		while next < header.num_frames {
-			if !frames[next as usize].is_empty() {
-				self.dest.write_all(&frames[next as usize]).map_err(|err| err.to_string())?;
-				next += 1;
-			}
-			let (encrypted, idx) = self.rx.recv().map_err(|err| err.to_string())?;
-			if idx == next as usize {
-				self.dest.write_all(&encrypted).map_err(|err| err.to_string())?;
-				next += 1;
-			} else {
-				frames[idx as usize] = encrypted; 
-			}
+			let frame = secretbox::seal(&chunk, &nonce, &key);
+			self.dest.write_all(&frame).map_err(|err| err.to_string())?;
 		}
 		Ok(())
 	}
@@ -401,7 +490,7 @@ mod example {
 
 	use self::sodiumoxide::crypto::box_::curve25519xsalsa20poly1305::{gen_keypair,precompute};
 
-	pub fn main() {
+	pub fn spipe() {
 
 		// Alice's key 
 		let (mut alice_pk, _) = gen_keypair();
@@ -411,10 +500,6 @@ mod example {
 
 		// Precomputed key
 		let pre_key = precompute(&mut alice_pk, &mut bob_sk);
-
-		// Start thread pool
-		let mut pool = Pool::default();
-		pool.start().unwrap();
 
 		// Open file 
 		let mut source = File::open("test.mp3").unwrap();
@@ -427,25 +512,81 @@ mod example {
 		let mut dest1 = Cursor::new(Vec::new());
 		let mut dest2 = Cursor::new(Vec::new());
 
+		let mut decrypted_bytes = vec![0u8; file_size as usize];
+
 		{
 			// Encrypt 
-			let mut pipe1 = Pipe::default(&pool, &pre_key, &mut source, &mut dest1);
+			let mut pipe1 = SPipe::new(&pre_key, &mut source, &mut dest1);
 			pipe1.encrypt(DEFAULT_CHUNK_SIZE, file_size, mime).unwrap();
 			pipe1.dest.set_position(0);
 
 			// Decrypt
-			let mut pipe2 = Pipe::default(&pool, &pre_key, &mut pipe1, &mut dest2);
+			let mut pipe2 = SPipe::new(&pre_key, &mut pipe1, &mut dest2);
 			pipe2.decrypt().unwrap();
 			pipe2.dest.set_position(0);
+
+			// Read decrypted bytes
+			pipe2.read_exact(&mut decrypted_bytes).unwrap();
 		}
 
-		// Read plain bytes into vector
+		// Read plain bytes
 		let mut file = File::open("./test.mp3").unwrap();
 		let mut plain_bytes = vec![0u8; file_size as usize];
 		file.read_exact(&mut plain_bytes).unwrap();
 
 		// Compare decrypted bytes to plain bytes
-		let decrypted_bytes = dest2.into_inner();
+		assert_eq!(plain_bytes, decrypted_bytes);	
+	}
+
+	pub fn tpipe() {
+
+		// Alice's key 
+		let (mut alice_pk, _) = gen_keypair();
+
+		// Bob's key
+		let (_, mut bob_sk) = gen_keypair();
+
+		// Precomputed key
+		let pre_key = precompute(&mut alice_pk, &mut bob_sk);
+
+		// Start thread pool
+		let mut pool = Pool::new(DEFAULT_POOL_SIZE);
+		pool.start().unwrap();
+
+		// Open file 
+		let mut source = File::open("test.mp3").unwrap();
+
+		// File mimetype and size 
+		let file_size = source.metadata().unwrap().len() as u32;
+		let mime = "audio/mp3".to_owned();
+
+		// Destinations
+		let dest1 = Cursor::new(Vec::new());
+		let dest2 = Cursor::new(Vec::new());
+
+		let mut decrypted_bytes = vec![0u8; file_size as usize];
+
+		{
+			// Encrypt 
+			let mut pipe1 = TPipe::new(&pool, &pre_key, &mut source, dest1);
+			pipe1.encrypt(DEFAULT_CHUNK_SIZE, file_size, mime).unwrap();
+			pipe1.dest.lock().unwrap().set_position(0);
+
+			// Decrypt
+			let mut pipe2 = TPipe::new(&pool, &pre_key, &mut pipe1, dest2);
+			pipe2.decrypt().unwrap();
+			pipe2.dest.lock().unwrap().set_position(0);
+
+			// Read decrypted bytes
+			pipe2.read_exact(&mut decrypted_bytes).unwrap();
+		}
+
+		// Read plain bytes
+		let mut file = File::open("./test.mp3").unwrap();
+		let mut plain_bytes = vec![0u8; file_size as usize];
+		file.read_exact(&mut plain_bytes).unwrap();
+
+		// Compare decrypted bytes to plain bytes
 		assert_eq!(plain_bytes, decrypted_bytes);
 
 		// Stop thread pool
@@ -454,10 +595,11 @@ mod example {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
 
 	use super::*;
 	use std::fs::File;
+	use self::test::Bencher;
 
 	const ALTERNATE_CHUNK_SIZE : u32 = 32768;
 
@@ -483,7 +625,7 @@ mod test {
 	fn total_encrypted_size(chunk_size: u32, file_size: u32, mime: String) -> u32 {
 		let key = secretbox::xsalsa20poly1305::gen_key();
 		let nonce = secretbox::xsalsa20poly1305::gen_nonce();
-		let header = Pipe::<Cursor<Vec<u8>>,Cursor<Vec<u8>>>::header(chunk_size, file_size, &key, mime, &nonce);
+		let header = header(chunk_size, file_size, &key, mime, &nonce);
 		header.encrypted_header_size() as u32 + header.encrypted_body_size
 	}
 
@@ -505,7 +647,7 @@ mod test {
 		assert_eq!(header, Header::decrypt(&pre_key, &mut rw).unwrap())
 	}
 
-	fn test_pipe(chunk_size: u32) {
+	fn test_spipe(chunk_size: u32) {
 
 		let pre_key = precompute_key();
 
@@ -513,31 +655,28 @@ mod test {
 		let meta = source.metadata().unwrap();
 		let file_size = meta.len() as u32;
 
-		let mut pool = Pool::default();
-		assert!(pool.start().is_ok());
-
 		let mut dest1 = Cursor::new(Vec::new());
 		let mut dest2 = Cursor::new(Vec::new());
 
 		{
-			let mut pipe1 = Pipe::default(&pool, &pre_key, &mut source, &mut dest1);
+			let mut pipe1 = SPipe::new(&pre_key, &mut source, &mut dest1);
 			pipe1.encrypt(chunk_size, file_size, "audio/mp3".to_owned()).unwrap();
 			pipe1.dest.set_position(0);
 
-			let mut pipe2 = Pipe::default(&pool, &pre_key, &mut pipe1, &mut dest2);
+			let mut pipe2 = SPipe::new(&pre_key, &mut pipe1, &mut dest2);
 			pipe2.decrypt().unwrap();
 			pipe2.dest.set_position(0);
 		}	
 
+		let decrypted_bytes = dest2.into_inner();
 		let mut file = File::open("./test.mp3").unwrap();
 		let mut plain_bytes = vec![0u8; file_size as usize];
 		file.read_exact(&mut plain_bytes).unwrap();
 
-		assert_eq!(plain_bytes, dest2.into_inner());
-		assert!(pool.stop().is_ok());
+		assert_eq!(plain_bytes, decrypted_bytes);
 	}
 
-	fn test_pipes(chunk_size_1: u32, chunk_size_2: u32) {
+	fn test_spipes(chunk_size_1: u32, chunk_size_2: u32) {
 
 		let pre_key1 = precompute_key();
 		let pre_key2 = precompute_key();
@@ -546,63 +685,220 @@ mod test {
 		let meta = source.metadata().unwrap();
 		let file_size = meta.len() as u32;
 
-		let mut pool = Pool::default();
-		assert!(pool.start().is_ok());
-
 		let mut dest1 = Cursor::new(Vec::new());
 		let mut dest2 = Cursor::new(Vec::new());
 		let mut dest3 = Cursor::new(Vec::new());
 		let mut dest4 = Cursor::new(Vec::new());
 
 		{
-			let mut pipe1 = Pipe::default(&pool, &pre_key1, &mut source, &mut dest1);
+			let mut pipe1 = SPipe::new(&pre_key1, &mut source, &mut dest1);
 			pipe1.encrypt(chunk_size_1, file_size, "audio/mp3".to_owned()).unwrap();
 			pipe1.dest.set_position(0); 
 
-			let mut pipe2 = Pipe::default(&pool, &pre_key2, &mut pipe1, &mut dest2);
+			let mut pipe2 = SPipe::new(&pre_key2, &mut pipe1, &mut dest2);
 			let size = total_encrypted_size(chunk_size_1, file_size, "audio/mp3".to_owned());
 			pipe2.encrypt(chunk_size_2, size, String::new()).unwrap();
 			pipe2.dest.set_position(0);
 
-			let mut pipe3 = Pipe::default(&pool, &pre_key2, &mut pipe2, &mut dest3);
+			let mut pipe3 = SPipe::new(&pre_key2, &mut pipe2, &mut dest3);
 			pipe3.decrypt().unwrap();
 			pipe3.dest.set_position(0);
 
-			let mut pipe4 = Pipe::default(&pool, &pre_key1, &mut pipe3, &mut dest4);
+			let mut pipe4 = SPipe::new(&pre_key1, &mut pipe3, &mut dest4);
 			pipe4.decrypt().unwrap();
 			pipe4.dest.set_position(0);
+		}	
+
+		let decrypted_bytes = dest4.into_inner();
+		let mut file = File::open("./test.mp3").unwrap();
+		let mut plain_bytes = vec![0u8; file_size as usize];
+		file.read_exact(&mut plain_bytes).unwrap();
+
+		assert_eq!(plain_bytes, decrypted_bytes);
+	}
+
+	fn test_tpipe(chunk_size: u32) {
+
+		let pre_key = precompute_key();
+
+		let mut source = File::open("./test.mp3").unwrap();
+		let meta = source.metadata().unwrap();
+		let file_size = meta.len() as u32;
+
+		let mut pool = Pool::new(DEFAULT_POOL_SIZE);
+		pool.start().unwrap();
+
+		let dest1 = Cursor::new(Vec::new());
+		let dest2 = Cursor::new(Vec::new());
+
+		let mut decrypted_bytes = vec![0u8; file_size as usize];
+
+		{
+			let mut pipe1 = TPipe::new(&pool, &pre_key, &mut source, dest1);
+			pipe1.encrypt(chunk_size, file_size, "audio/mp3".to_owned()).unwrap();
+			pipe1.dest.lock().unwrap().set_position(0);
+
+			let mut pipe2 = TPipe::new(&pool, &pre_key, &mut pipe1, dest2);
+			pipe2.decrypt().unwrap();
+			pipe2.dest.lock().unwrap().set_position(0);
+
+			pipe2.read_exact(&mut decrypted_bytes).unwrap();
+		}
+
+		let mut file = File::open("./test.mp3").unwrap();
+		let mut plain_bytes = vec![0u8; file_size as usize];
+		file.read_exact(&mut plain_bytes).unwrap();
+
+		assert_eq!(plain_bytes, decrypted_bytes);
+		pool.stop().unwrap();
+	}
+
+	fn test_tpipes(chunk_size_1: u32, chunk_size_2: u32) {
+
+		let pre_key1 = precompute_key();
+		let pre_key2 = precompute_key();
+
+		let mut source = File::open("./test.mp3").unwrap();
+		let meta = source.metadata().unwrap();
+		let file_size = meta.len() as u32;
+
+		let mut pool = Pool::new(DEFAULT_POOL_SIZE);
+		pool.start().unwrap();
+
+		let dest1 = Cursor::new(Vec::new());
+		let dest2 = Cursor::new(Vec::new());
+		let dest3 = Cursor::new(Vec::new());
+		let dest4 = Cursor::new(Vec::new());
+
+		let mut decrypted_bytes = vec![0u8; file_size as usize];
+
+		{
+
+			let mut pipe1 = TPipe::new(&pool, &pre_key1, &mut source, dest1);
+			pipe1.encrypt(chunk_size_1, file_size, "audio/mp3".to_owned()).unwrap();
+			pipe1.dest.lock().unwrap().set_position(0);
+
+			let mut pipe2 = TPipe::new(&pool, &pre_key2, &mut pipe1, dest2);
+			let size = total_encrypted_size(chunk_size_1, file_size, "audio/mp3".to_owned());
+			pipe2.encrypt(chunk_size_2, size, String::new()).unwrap();
+			pipe2.dest.lock().unwrap().set_position(0);
+
+			let mut pipe3 = TPipe::new(&pool, &pre_key2, &mut pipe2, dest3);
+			pipe3.decrypt().unwrap();
+			pipe3.dest.lock().unwrap().set_position(0);
+
+			let mut pipe4 = TPipe::new(&pool, &pre_key1, &mut pipe3, dest4);
+			pipe4.decrypt().unwrap();
+			pipe4.dest.lock().unwrap().set_position(0);
+
+			pipe4.read_exact(&mut decrypted_bytes).unwrap();
 		}	
 
 		let mut file = File::open("./test.mp3").unwrap();
 		let mut plain_bytes = vec![0u8; file_size as usize];
 		file.read_exact(&mut plain_bytes).unwrap();
 
-		assert_eq!(plain_bytes, dest4.into_inner());
-		assert!(pool.stop().is_ok());
+		assert_eq!(plain_bytes, decrypted_bytes);
+		pool.stop().unwrap();
 	}
 
 	#[test]
-	fn test_pipe_with_default_chunk_size() {
-		test_pipe(DEFAULT_CHUNK_SIZE)
+	fn test_spipe_with_default_chunk_size() {
+		test_spipe(DEFAULT_CHUNK_SIZE)
 	}
 
 	#[test]
-	fn test_pipe_with_alternate_chunk_size() {
-		test_pipe(ALTERNATE_CHUNK_SIZE)
+	fn test_spipe_with_alternate_chunk_size() {
+		test_spipe(ALTERNATE_CHUNK_SIZE)
 	}
 
 	#[test]
-	fn test_pipes_with_default_chunk_size() {
-		test_pipes(DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE)
+	fn test_spipes_with_default_chunk_size() {
+		test_spipes(DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE)
 	}
 
 	#[test]
-	fn test_pipes_with_different_chunk_sizes() {
-		test_pipes(DEFAULT_CHUNK_SIZE, ALTERNATE_CHUNK_SIZE)
+	fn test_spipes_with_different_chunk_sizes() {
+		test_spipes(DEFAULT_CHUNK_SIZE, ALTERNATE_CHUNK_SIZE)
 	}
 
 	#[test]
-	fn test_example() {
-		example::main()
+	fn test_tpipe_with_default_chunk_size() {
+		test_tpipe(DEFAULT_CHUNK_SIZE)
+	}
+
+	#[test]
+	fn test_tpipe_with_alternate_chunk_size() {
+		test_tpipe(ALTERNATE_CHUNK_SIZE)
+	}
+
+	#[test]
+	fn test_tpipes_with_default_chunk_size() {
+		test_tpipes(DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE)
+	}
+
+	#[test]
+	fn test_tpipes_with_different_chunk_sizes() {
+		test_tpipes(DEFAULT_CHUNK_SIZE, ALTERNATE_CHUNK_SIZE)
+	}
+
+	#[test]
+	fn test_spipe_example() {
+		example::spipe()
+	}
+
+	#[test]
+	fn test_tpipe_example() {
+		example::tpipe()
+	}
+
+	#[bench]
+	fn bench_spipe(b: &mut Bencher) {
+		b.iter(|| test_spipe(DEFAULT_CHUNK_SIZE));
+	}
+
+	#[bench]
+	fn bench_tpipe(b: &mut Bencher) {
+
+		let mut pool1 = Pool::new(DEFAULT_POOL_SIZE);
+		pool1.start().unwrap();
+
+		let mut pool2 = Pool::new(DEFAULT_POOL_SIZE);
+		pool2.start().unwrap();
+
+		b.iter(|| {
+
+			let pre_key = precompute_key();
+
+			let mut source = File::open("./test.mp3").unwrap();
+			let meta = source.metadata().unwrap();
+			let file_size = meta.len() as u32;
+
+			let dest1 = Cursor::new(Vec::new());
+			let dest2 = Cursor::new(Vec::new());
+
+			let mut decrypted_bytes = vec![0u8; file_size as usize];
+
+			{
+				let mut pipe1 = TPipe::new(&pool1, &pre_key, &mut source, dest1);
+				pipe1.encrypt(DEFAULT_CHUNK_SIZE, file_size, "audio/mp3".to_owned()).unwrap();
+				pipe1.dest.lock().unwrap().set_position(0);
+
+				let mut pipe2 = TPipe::new(&pool2, &pre_key, &mut pipe1, dest2);
+				pipe2.decrypt().unwrap();
+				pipe2.dest.lock().unwrap().set_position(0);
+
+				pipe2.read_exact(&mut decrypted_bytes).unwrap();
+			}	
+
+			let mut file = File::open("./test.mp3").unwrap();
+			let mut plain_bytes = vec![0u8; file_size as usize];
+			file.read_exact(&mut plain_bytes).unwrap();
+
+			assert_eq!(plain_bytes, decrypted_bytes);
+		});
+
+		pool1.stop().unwrap();
+		pool2.stop().unwrap();
 	}
 }
