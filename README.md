@@ -5,49 +5,45 @@ example:
 ```rust 
 use std::fs::File;
 use std::io::Cursor;
-use sodiumoxide::secretbox::xsalsa20poly1305::{gen_key,gen_nonce};
+use sodiumoxide::secretbox::{gen_key,gen_nonce};
 
-pub fn main() {
+fn main() {
 
-	// Generate key
-	let key = gen_key();
+    // Generate key and nonce
+    let key = secretbox::gen_key();
+    let nonce = secretbox::gen_nonce();
 
-	// Generate nonce 
-	let nonce = gen_nonce();
+    let mut cipher = Cursor::new(Vec::new());
+    let mut plain = File::open("test.mp3").unwrap();
+    let mut decrypted = Cursor::new(Vec::new());
 
-	// Open file 
-	let mut source = File::open("test.mp3").unwrap();
+    // File mimetype and size 
+    let file_size = plain.metadata().unwrap().len() as u32;
+    let mime = "audio/mp3".to_owned();
 
-	// File mimetype and size 
-	let file_size = source.metadata().unwrap().len() as u32;
-	let mime = "audio/mp3".to_owned();
+    {
+        // Encrypt 
+        let mut pipe1 = Pipe::new(&mut cipher, key.clone(), nonce.clone());
+        pipe1.encrypt(DEFAULT_CHUNK_SIZE, file_size, mime, &mut plain).unwrap();
+        pipe1.cipher.set_position(0);
+    }
 
-	// Destinations
-	let mut dest1 = Cursor::new(Vec::new());
-	let mut dest2 = Cursor::new(Vec::new());
+    {
+        // Decrypt
+        let mut pipe2 = Pipe::new(&mut cipher, key, nonce);
+        pipe2.decrypt(&mut decrypted).unwrap();
+    }
 
-	{
-		// Encrypt 
-		let mut pipe1 = Pipe::new(&key, &nonce, &mut source, &mut dest1);
-		pipe1.encrypt(DEFAULT_CHUNK_SIZE, file_size, mime).unwrap();
-		pipe1.dest.set_position(0);
+    // Read plain bytes
+    let mut plain = File::open("test.mp3").unwrap();
+    let mut plain_bytes = vec![0u8; file_size as usize];
+    plain.read_exact(&mut plain_bytes).unwrap();
 
-		// Decrypt
-		let mut pipe2 = Pipe::new(&key, &nonce, &mut pipe1, &mut dest2);
-		pipe2.decrypt().unwrap();
-		pipe2.dest.set_position(0);
-	}
+    // Get decrypted bytes
+    let decrypted_bytes = decrypted.into_inner();
 
-	// Read plain bytes
-	let mut file = File::open("./test.mp3").unwrap();
-	let mut plain_bytes = vec![0u8; file_size as usize];
-	file.read_exact(&mut plain_bytes).unwrap();
-
-	// Get decrypted bytes
-	let decrypted_bytes = dest2.into_inner();
-
-	// Compare decrypted bytes to plain bytes
-	assert_eq!(plain_bytes, decrypted_bytes);	
+    // Compare decrypted bytes to plain bytes
+    assert_eq!(plain_bytes, decrypted_bytes);
 }
 ```
 
