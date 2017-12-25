@@ -1,9 +1,9 @@
-// #![feature(test)]
+#![feature(test)]
 
 extern crate bufstream;
 extern crate byteorder;
 extern crate sodiumoxide;
-// extern crate test;
+extern crate test;
 
 use std::clone::Clone;
 use std::collections::HashMap;
@@ -313,7 +313,7 @@ impl Conn {
         }
     }
 
-    fn send_handshake(&mut self, alias: &str) -> Result<(),String> {
+    fn connect(&mut self, alias: &str) -> Result<(),String> {
         let mut handshake = self.pipe.key.0.to_vec();
         handshake.extend_from_slice(&self.pipe.nonce.0);
         handshake.extend_from_slice(alias.as_bytes());
@@ -323,7 +323,7 @@ impl Conn {
         self.flush().map_err(|err| err.to_string())
     }
 
-    fn recv_handshake(&mut self) -> Result<String,String> {
+    fn accept(&mut self) -> Result<String,String> {
         let handshake_size = self.read_u32::<BigEndian>().map_err(|err| err.to_string())?;
         let mut handshake = vec![0u8; handshake_size as usize];
         self.read_exact(&mut handshake).map_err(|err| err.to_string())?;
@@ -382,6 +382,7 @@ impl PartialEq for Conn_ {
 
 #[derive(Debug)]
 pub struct Hub {
+    addr: String,
     alias: String,
     conns: Arc<Mutex<HashMap<String,Conn_>>>,
     listener: TcpListener,
@@ -396,8 +397,10 @@ impl Hub {
         let alias = alias.to_owned();
         let conns = Arc::new(Mutex::new(HashMap::new()));
         let listener = TcpListener::bind(addr).unwrap();
+        let addr = addr.to_owned();
         let nonce = box_::gen_nonce();
         Hub{
+            addr,
             alias,
             conns,
             listener,
@@ -456,7 +459,7 @@ impl Hub {
         }
         let pipe = Pipe::new(stream);
         let mut conn = Conn::new(nonce, pipe, &pub_key, &sec_key);
-        conn.send_handshake(alias)?;
+        conn.connect(alias)?;
         let (txd, txe) = conn.run();
         let conn = Conn_{conn, txd, txe};
         conns.insert(alias_, conn);
@@ -478,7 +481,7 @@ impl Hub {
         stream.flush().map_err(|err| err.to_string())?;
         let pipe = Pipe::new(stream);
         let mut conn = Conn::new(self.nonce.clone(), pipe, &pub_key, &self.sec_key);
-        let alias = conn.recv_handshake()?;
+        let alias = conn.accept()?;
         let mut conns = self.conns.lock().unwrap();
         if conns.contains_key(&alias) {
             return Err(format!("Hub already has conn with alias='{}'", alias))
@@ -499,37 +502,106 @@ mod example {
 
     pub fn pipe() {
 
-        // Open file
+        // open file
         let mut file = File::open("test.mp3").unwrap();
         let file_size = file.metadata().unwrap().len() as u32;
         let mime = "audio/mp3".to_owned();
 
-        // New pipe
-        let cipher = Cursor::new(Vec::new());
-        let mut pipe = Pipe::new(cipher);
-
-        // Encrypt 
-        pipe.encrypt(DEFAULT_CHUNK_SIZE, file_size, mime, &mut file).unwrap();
-        pipe.cipher.set_position(0);
-
-        // Decrypt
-        let mut decrypted = Cursor::new(Vec::new());
-        pipe.decrypt(&mut decrypted).unwrap();
-
-        // Read plain bytes
-        let mut file = File::open("test.mp3").unwrap();
+        // read plain bytes
         let mut plain_bytes = vec![0u8; file_size as usize];
         file.read_exact(&mut plain_bytes).unwrap();
 
-        // Get decrypted bytes
-        let decrypted_bytes = decrypted.into_inner();
+        // new pipe
+        let cipher = Cursor::new(Vec::new());
+        let mut pipe = Pipe::new(cipher);
 
-        // Compare decrypted bytes to plain bytes
+        // encrypt 
+        pipe.encrypt(DEFAULT_CHUNK_SIZE, file_size, mime, &mut plain_bytes.as_slice()).unwrap();
+        pipe.cipher.set_position(0);
+
+        // decrypt
+        let mut decrypted_bytes = Vec::new();
+        pipe.decrypt(&mut decrypted_bytes).unwrap();
+
+        // compare decrypted bytes to plain bytes
         assert_eq!(plain_bytes, decrypted_bytes);
     }
 
     pub fn conn() {
 
+        // generate nonce and keypairs
+        let nonce = box_::gen_nonce();
+        let (pk1, sk1) = box_::gen_keypair();
+        let (pk2, sk2) = box_::gen_keypair();
+
+        // create tcp streams
+        let listener = TcpListener::bind("127.0.0.1:12345").unwrap();
+        let handle = thread::spawn(|| TcpStream::connect("127.0.0.1:12345").unwrap());
+        let (stream1, _) = listener.accept().unwrap();
+        let stream2 = handle.join().unwrap();
+
+        // create conns
+        let pipe1 = Pipe::new(BufTcpStream::new(stream1));
+        let pipe2 = Pipe::new(BufTcpStream::new(stream2));
+        let mut conn1 = Conn::new(nonce, pipe1, &pk2, &sk1);
+        let mut conn2 = Conn::new(nonce, pipe2, &pk1, &sk2);
+
+        // connect conns
+        let alias = "conn1".to_owned();
+        conn1.connect(&alias).unwrap();
+        conn2.accept().unwrap();
+
+        // run conns
+        let (_, txe) = conn1.run();
+        let (txd, _) = conn2.run();
+
+        // open file
+        let mut file = File::open("test.mp3").unwrap();
+        let file_size = file.metadata().unwrap().len() as u32;
+        let mime = "audio/mp3".to_owned();
+
+        // read plain bytes
+        let mut plain_bytes = vec![0u8; file_size as usize];
+        file.read_exact(&mut plain_bytes).unwrap();
+
+        // conn1 encrypts, conn2 decrypts
+        conn1.encrypt(DEFAULT_CHUNK_SIZE, mime, &mut plain_bytes.as_slice(), &txe).unwrap();
+        let decrypted_bytes = conn2.decrypt(&txd).unwrap();
+
+        // compare decrypted bytes to plain bytes
+        assert_eq!(decrypted_bytes, plain_bytes);
+    }
+
+    pub fn hub() {
+
+        // generate keypairs
+        let (pub_key1, sec_key1) = box_::gen_keypair();
+        let (pub_key2, sec_key2) = box_::gen_keypair();
+
+        // create hubs
+        let mut hub1 = Hub::new("127.0.0.1:10000", "hub1", pub_key1, sec_key1);
+        let mut hub2 = Hub::new("127.0.0.1:20000", "hub2", pub_key2, sec_key2);
+
+        // run hubs and connect them
+        hub1.run().unwrap();
+        hub2.run().unwrap();
+        hub1.connect(&hub2.addr).unwrap();
+
+        // open file
+        let mut file = File::open("test.mp3").unwrap();
+        let file_size = file.metadata().unwrap().len();
+        let mime = "audio/mp3".to_owned();
+
+        // read plain bytes 
+        let mut plain_bytes = vec![0u8; file_size as usize];
+        file.read_exact(&mut plain_bytes).unwrap();
+
+        // hub1 encrypts, hub2 decrypts
+        hub1.encrypt(&hub2.alias, DEFAULT_CHUNK_SIZE, mime, &mut plain_bytes.as_slice()).unwrap();
+        let decrypted_bytes = hub2.decrypt(&hub1.alias).unwrap();
+
+        // compare decrypted bytes to plain bytes
+        assert_eq!(plain_bytes, decrypted_bytes);
     }
 }
 
@@ -540,9 +612,13 @@ mod tests {
     use std::fs::File;
     use std::net::{TcpListener,TcpStream};
     use std::thread;
-    // use self::test::Bencher;
+    use self::test::Bencher;
 
     const ALTERNATE_CHUNK_SIZE : u32 = 32768;
+
+    fn mime() -> String {
+        "audio/mp3".to_owned()
+    }
 
     fn gen_key_nonce() -> (secretbox::Key,secretbox::Nonce) {
         let key = secretbox::gen_key();
@@ -553,20 +629,165 @@ mod tests {
     fn new_header() -> Header {
         let encrypted_body_size = 49225 + secretbox::MACBYTES as u32;
         let frame_size = DEFAULT_CHUNK_SIZE + secretbox::MACBYTES as u32;
+        let mime = mime();
+        let num_frames = 4;
         Header{
             encrypted_body_size,
             frame_size,
-            mime: "image/png".to_owned(),
-            num_frames: 4,
+            mime,
+            num_frames,
         }
     }
 
-    fn get_plain_bytes() -> Vec<u8> {
+    fn read_file() -> (Vec<u8>, u32) {
         let mut file = File::open("test.mp3").unwrap();
-        let file_size = file.metadata().unwrap().len() as usize;
-        let mut plain_bytes = vec![0u8; file_size];
-        file.read_exact(&mut plain_bytes).unwrap();
-        plain_bytes
+        let file_size = file.metadata().unwrap().len();
+        let mut file_bytes = vec![0u8; file_size as usize];
+        file.read_exact(&mut file_bytes).unwrap();
+        (file_bytes, file_size as u32)
+    }
+
+    fn new_pipe() -> Pipe<Cursor<Vec<u8>>> {
+        let cipher = Cursor::new(Vec::new());
+        Pipe::new(cipher)
+    }
+
+    fn total_encrypted_size(chunk_size: u32, file_size: u32, mime: String) -> u32 {
+        let header = header(chunk_size, file_size, mime);
+        header.encrypted_header_size() as u32 + header.encrypted_body_size
+    }
+
+    fn encrypt_and_decrypt_with_pipe(chunk_size: u32, file_bytes: &Vec<u8>, file_size: u32, pipe: &mut Pipe<Cursor<Vec<u8>>>) -> (Header,Vec<u8>) {
+
+        pipe.encrypt(chunk_size, file_size, mime(), &mut file_bytes.as_slice()).unwrap();
+        pipe.cipher.set_position(0);
+
+        let mut decrypted_bytes = Vec::new();
+        let header = pipe.decrypt(&mut decrypted_bytes).unwrap();
+        pipe.cipher.set_position(0);
+
+        (header,decrypted_bytes)
+    }
+
+    fn check_header(actual: Header, chunk_size: u32, file_size: u32) {
+        let expected = header(chunk_size, file_size, mime());
+        assert_eq!(expected, actual);
+    }
+
+    fn check_headers(actual1: Header, actual2: Header, chunk_size1: u32, chunk_size2: u32, file_size: u32) {
+        check_header(actual1, chunk_size1, file_size);
+        let encrypted_size = total_encrypted_size(chunk_size1, file_size, mime());
+        let expected2 = header(chunk_size2, encrypted_size, String::new());
+        assert_eq!(expected2, actual2);
+    }
+
+    fn check_decrypted_bytes(file_bytes: &[u8], decrypted_bytes: &[u8]) {
+        assert_eq!(file_bytes, decrypted_bytes);
+    }
+
+    fn encrypt2x_and_decrypt2x_with_pipe(chunk_size1: u32, chunk_size2: u32, file_bytes: &Vec<u8>, file_size: u32, pipe: &mut Pipe<Cursor<Vec<u8>>>) -> (Header,Header,Vec<u8>) {
+
+        let encrypted_size = total_encrypted_size(chunk_size1, file_size, mime());
+
+        pipe.encrypt(chunk_size1, file_size, mime(), &mut file_bytes.as_slice()).unwrap();
+        pipe.cipher.set_position(0); 
+        
+        pipe.encrypt_self(chunk_size2, encrypted_size, String::new()).unwrap();
+        pipe.cipher.set_position(0);
+
+        let header2 = pipe.decrypt_self().unwrap();
+        pipe.cipher.set_position(0);
+
+        let mut decrypted_bytes = Vec::new();
+        let header1 = pipe.decrypt(&mut decrypted_bytes).unwrap();
+        pipe.cipher.set_position(0);
+
+        (header1,header2,decrypted_bytes)
+    }
+
+    fn new_conns() -> (Conn,Conn) {
+
+        let listener = TcpListener::bind("127.0.0.1:12345").unwrap();
+
+        let handle = thread::spawn(|| {
+            TcpStream::connect("127.0.0.1:12345").unwrap()
+        });
+
+        let (stream1, _) = listener.accept().unwrap();
+        let stream2 = handle.join().unwrap();
+
+        let nonce = box_::gen_nonce();
+        let (pk1, sk1) = box_::gen_keypair();
+        let (pk2, sk2) = box_::gen_keypair();
+
+        let cipher1 = BufTcpStream::new(stream1);
+        let pipe1 = Pipe::new(cipher1);
+        let conn1 = Conn::new(nonce, pipe1, &pk2, &sk1);
+
+        let cipher2 = BufTcpStream::new(stream2);
+        let pipe2 = Pipe::new(cipher2);
+        let conn2 = Conn::new(nonce, pipe2, &pk1, &sk2);
+
+        (conn1,conn2)
+    }
+
+    fn connect_conns(conn1: &mut Conn, conn2: &mut Conn) -> (Sender<()>,Sender<Job>) {
+
+        let alias = "george_costanza".to_owned();
+
+        conn1.connect(&alias).unwrap();
+        assert_eq!(alias, conn2.accept().unwrap());
+        assert_eq!(conn1, conn2);
+
+        let (_, txe) = conn1.run();
+        let (txd, _) = conn2.run();
+
+        (txd, txe)
+    }
+
+    fn encrypt_and_decrypt_with_conns(conn1: &mut Conn, conn2: &mut Conn, file_bytes: &Vec<u8>, txd: &Sender<()>, txe: &Sender<Job>) -> Vec<u8> {
+        conn1.encrypt(DEFAULT_CHUNK_SIZE, "audio/mp3".to_owned(), &mut file_bytes.as_slice(), txe).unwrap();
+        conn2.decrypt(txd).unwrap()
+    }
+
+    fn new_hubs() -> (Hub,Hub) {
+
+        let (pub_key1, sec_key1) = box_::gen_keypair();
+        let (pub_key2, sec_key2) = box_::gen_keypair();
+
+        let hub1 = Hub::new("127.0.0.1:11111", "hub1", pub_key1, sec_key1);
+        let hub2 = Hub::new("127.0.0.1:22222", "hub2", pub_key2, sec_key2);
+
+        (hub1, hub2)
+    }
+
+    fn connect_hubs(hub1: &mut Hub, hub2: &mut Hub) {
+
+        hub1.run().unwrap();
+        hub2.run().unwrap();
+
+        hub1.connect(&hub2.addr).unwrap();
+
+        let conns1 = hub1.conns.lock().unwrap();
+        let conns2 = hub2.conns.lock().unwrap();
+
+        assert_eq!(1, conns1.len());
+        assert_eq!(1, conns2.len());
+
+        let conn1 = conns1.get(&hub2.alias);
+        let conn2 = conns2.get(&hub1.alias);
+        
+        assert_eq!(conn1, conn2);
+    }
+    
+    fn encrypt_and_decrypt_with_hubs(hub1: &mut Hub, hub2: &mut Hub, file_bytes: &Vec<u8>) -> Vec<u8> {
+        hub1.encrypt(&hub2.alias, DEFAULT_CHUNK_SIZE, "audio/mp3".to_owned(), &mut file_bytes.as_slice()).unwrap();
+        hub2.decrypt(&hub1.alias).unwrap()
+    }
+
+    fn try_to_connect_hubs_again(hub1: &mut Hub, hub2: &mut Hub) {
+        assert!(hub1.connect(&hub2.addr).is_err());
+        assert!(hub2.connect(&hub1.addr).is_err());
     }
 
     #[test]
@@ -583,199 +804,91 @@ mod tests {
         let (key, nonce) = gen_key_nonce();
         header.encrypt(&key, &nonce, &mut rw).unwrap();
         rw.set_position(0);
-        assert_eq!(header, Header::decrypt(&key, &nonce, &mut rw).unwrap())
-    }
-
-    fn total_encrypted_size(chunk_size: u32, file_size: u32, mime: String) -> u32 {
-        let header = header(chunk_size, file_size, mime);
-        header.encrypted_header_size() as u32 + header.encrypted_body_size
-    }
-
-    fn test_pipe(chunk_size: u32) {
-
-        let mut file = File::open("test.mp3").unwrap();
-        let file_size = file.metadata().unwrap().len() as u32;
-        let mime = "audio/mp3".to_owned();
-        let header = header(chunk_size, file_size, mime.clone());
-
-        let cipher = Cursor::new(Vec::new());
-        let mut pipe = Pipe::new(cipher);
-
-        let hdr = pipe.encrypt(chunk_size, file_size, "audio/mp3".to_owned(), &mut file).unwrap();
-        assert_eq!(header, hdr);
-        pipe.cipher.set_position(0);
-
-        let mut decrypted = Cursor::new(Vec::new());
-        let hdr = pipe.decrypt(&mut decrypted).unwrap();
-        assert_eq!(header, hdr);  
-
-        let plain_bytes = get_plain_bytes();
-        let decrypted_bytes = decrypted.into_inner();
-
-        assert_eq!(plain_bytes, decrypted_bytes);
-    }
-
-    fn test_pipes(chunk_size1: u32, chunk_size2: u32) {
-
-        let mut file = File::open("test.mp3").unwrap();
-        let mime = "audio/mp3".to_owned();
-        let file_size1 = file.metadata().unwrap().len() as u32;
-        let file_size2 = total_encrypted_size(chunk_size1, file_size1, mime.clone());
-
-        let header1 = header(chunk_size1, file_size1, mime.clone());
-        let header2 = header(chunk_size2, file_size2, String::new());
-
-        let cipher = Cursor::new(Vec::new());
-        let mut pipe = Pipe::new(cipher);
-
-        let hdr = pipe.encrypt(chunk_size1, file_size1, mime, &mut file).unwrap();
-        assert_eq!(header1, hdr);
-        pipe.cipher.set_position(0); 
-        
-        let hdr = pipe.encrypt_self(chunk_size2, file_size2, String::new()).unwrap();
-        assert_eq!(header2, hdr);
-        pipe.cipher.set_position(0);
-
-        let hdr = pipe.decrypt_self().unwrap();
-        assert_eq!(header2, hdr);
-        pipe.cipher.set_position(0);
-
-        let mut decrypted = Cursor::new(Vec::new());
-        let hdr = pipe.decrypt(&mut decrypted).unwrap();
-        assert_eq!(header1, hdr); 
-
-        let plain_bytes = get_plain_bytes();
-        let decrypted_bytes = decrypted.into_inner();
-
-        assert_eq!(plain_bytes, decrypted_bytes);
+        assert_eq!(header, Header::decrypt(&key, &nonce, &mut rw).unwrap());
     }
 
     #[test]
-    fn test_pipe_with_default_chunk_size() {
-        test_pipe(DEFAULT_CHUNK_SIZE)
-    }
+    fn test_pipe() {
 
-    #[test]
-    fn test_pipe_with_alternate_chunk_size() {
-        test_pipe(ALTERNATE_CHUNK_SIZE)
-    }
+        let mut pipe = new_pipe();
+        let (file_bytes, file_size) = read_file();
 
-    #[test]
-    fn test_pipes_with_default_chunk_size() {
-        test_pipes(DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE)
-    }
+        let (header,decrypted_bytes) = encrypt_and_decrypt_with_pipe(DEFAULT_CHUNK_SIZE, &file_bytes, file_size, &mut pipe);
+        check_header(header, DEFAULT_CHUNK_SIZE, file_size);
+        check_decrypted_bytes(&file_bytes, &decrypted_bytes);
 
-    #[test]
-    fn test_pipes_with_different_chunk_sizes() {
-        test_pipes(DEFAULT_CHUNK_SIZE, ALTERNATE_CHUNK_SIZE)
-    }
+        let (header,decrypted_bytes) = encrypt_and_decrypt_with_pipe(ALTERNATE_CHUNK_SIZE, &file_bytes, file_size, &mut pipe);
+        check_header(header, ALTERNATE_CHUNK_SIZE, file_size);
+        check_decrypted_bytes(&file_bytes, &decrypted_bytes);
 
-    #[test]
-    fn test_pipe_example() {
-        example::pipe()
-    }
+        let (header1,header2,decrypted_bytes) = encrypt2x_and_decrypt2x_with_pipe(DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE, &file_bytes, file_size, &mut pipe);
+        check_headers(header1, header2, DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE, file_size);
+        check_decrypted_bytes(&file_bytes, &decrypted_bytes);
 
-    // #[bench]
-    // fn bench_pipe(b: &mut Bencher) {
-    //  b.iter(|| test_pipe(DEFAULT_CHUNK_SIZE));
-    // }
+        let (header1,header2,decrypted_bytes) = encrypt2x_and_decrypt2x_with_pipe(DEFAULT_CHUNK_SIZE, ALTERNATE_CHUNK_SIZE, &file_bytes, file_size, &mut pipe);
+        check_headers(header1, header2, DEFAULT_CHUNK_SIZE, ALTERNATE_CHUNK_SIZE, file_size);
+        check_decrypted_bytes(&file_bytes, &decrypted_bytes);
+
+        example::pipe();
+    }
 
     #[test]
     fn test_conn() {
 
-        let listener = TcpListener::bind("127.0.0.1:12345").unwrap();
-        let handle = thread::spawn(|| {
-            TcpStream::connect("127.0.0.1:12345").unwrap()
-        });
+        let (mut conn1, mut conn2) = new_conns();
+        let (file_bytes, _) = read_file();
 
-        let (server_stream, _) = listener.accept().unwrap();
-        let client_stream = handle.join().unwrap();
+        let (txd, txe) = connect_conns(&mut conn1, &mut conn2);
 
-        let nonce = box_::gen_nonce();
-        let (client_pk, client_sk) = box_::gen_keypair();
-        let (server_pk, server_sk) = box_::gen_keypair();
-
-        let client_cipher = BufTcpStream::new(client_stream);
-        let client_pipe = Pipe::new(client_cipher);
-        let mut client_conn = Conn::new(nonce, client_pipe, &server_pk, &client_sk);
-
-        let server_cipher = BufTcpStream::new(server_stream);
-        let server_pipe = Pipe::new(server_cipher);
-        let mut server_conn = Conn::new(nonce, server_pipe, &client_pk, &server_sk);
-
-        let alias = "george_costanza".to_owned();
-
-        client_conn.send_handshake(&alias).unwrap();
-        assert_eq!(alias, server_conn.recv_handshake().unwrap());
-
-        assert_eq!(client_conn.pipe.key, server_conn.pipe.key);
-        assert_eq!(client_conn.pipe.nonce, server_conn.pipe.nonce);
-
-        let (_, client_txe) = client_conn.run();
-        let (server_txd, _) = server_conn.run();
-
-        let mut file = File::open("test.mp3").unwrap();
-        client_conn.encrypt(DEFAULT_CHUNK_SIZE, "audio/mp3".to_owned(), &mut file, &client_txe).unwrap();
+        let decrypted_bytes = encrypt_and_decrypt_with_conns(&mut conn1, &mut conn2, &file_bytes, &txd, &txe);
+        check_decrypted_bytes(&file_bytes, &decrypted_bytes);
         
-        let decrypted_bytes = server_conn.decrypt(&server_txd).unwrap();
-        let plain_bytes = get_plain_bytes();
-
-        assert_eq!(decrypted_bytes, plain_bytes);
+        example::conn();
     }
-    
+
     #[test]
     fn test_hub() {
 
-        let addr1 = "127.0.0.1:54320";
-        let addr2 = "127.0.0.1:54321";
-        let addr3 = "127.0.0.1:10080";
+        let (mut hub1, mut hub2) = new_hubs();
+        let (file_bytes, _) = read_file();
 
-        let alias1 = "hub1";
-        let alias2 = "hub2";
-        let alias3 = "hub3";
+        connect_hubs(&mut hub1, &mut hub2);
 
-        let (pub_key1, sec_key1) = box_::gen_keypair();
-        let (pub_key2, sec_key2) = box_::gen_keypair();
-        let (pub_key3, sec_key3) = box_::gen_keypair();
+        let decrypted_bytes = encrypt_and_decrypt_with_hubs(&mut hub1, &mut hub2, &file_bytes);
+        check_decrypted_bytes(&file_bytes, &decrypted_bytes);
 
-        let mut hub1 = Hub::new(addr1, alias1, pub_key1, sec_key1);
-        let mut hub2 = Hub::new(addr2, alias2, pub_key2, sec_key2);
-        let mut hub3 = Hub::new(addr3, alias3, pub_key3, sec_key3);
+        try_to_connect_hubs_again(&mut hub1, &mut hub2);
 
-        hub1.run().unwrap();
-        hub2.run().unwrap();
+        example::hub();
+    }
 
-        hub1.connect(addr2).unwrap();
+    #[bench]
+    fn bench_pipe(b: &mut Bencher) {
+        let (file_bytes, file_size) = read_file();
+        let mut pipe = new_pipe();
+        b.iter(|| encrypt_and_decrypt_with_pipe(DEFAULT_CHUNK_SIZE, &file_bytes, file_size, &mut pipe));
+    }
 
-        assert_eq!(1, hub1.conns.lock().unwrap().len());
-        assert_eq!(1, hub2.conns.lock().unwrap().len());
+    #[bench]
+    fn bench_pipe2x(b: &mut Bencher) {
+        let (file_bytes, file_size) = read_file();
+        let mut pipe = new_pipe();
+        b.iter(|| encrypt2x_and_decrypt2x_with_pipe(DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE, &file_bytes, file_size, &mut pipe));
+    }
 
-        {   
-            let conns1 = hub1.conns.lock().unwrap();
-            let conns2 = hub2.conns.lock().unwrap();
-            let conn1 = conns1.get(alias2);
-            let conn2 = conns2.get(alias1);
-            assert_eq!(conn1, conn2);
-        }
+    #[bench]
+    fn bench_conn(b: &mut Bencher) {
+        let (file_bytes, _) = read_file();
+        let (mut conn1, mut conn2) = new_conns();
+        let (txd, txe) = connect_conns(&mut conn1, &mut conn2);
+        b.iter(|| encrypt_and_decrypt_with_conns(&mut conn1, &mut conn2, &file_bytes, &txd, &txe));
+    }
 
-        let mut file = File::open("test.mp3").unwrap();
-        let mime = "audio/mp3".to_owned();
-
-        hub1.encrypt(alias2, DEFAULT_CHUNK_SIZE, mime, &mut file).unwrap();
-
-        let plain_bytes = get_plain_bytes();
-        let decrypted_bytes = hub2.decrypt(alias1).unwrap();
-
-        assert_eq!(plain_bytes, decrypted_bytes);
-
-        hub3.run().unwrap();
-        hub1.connect(addr3).unwrap();
-        hub2.connect(addr3).unwrap();
-
-        assert_eq!(2, hub1.conns.lock().unwrap().len());
-        assert_eq!(2, hub2.conns.lock().unwrap().len());
-        assert_eq!(2, hub3.conns.lock().unwrap().len());
-
-        assert!(hub2.connect(addr1).is_err());
+    #[bench]
+    fn bench_hub(b: &mut Bencher) {
+        let (file_bytes, _) = read_file();
+        let (mut hub1, mut hub2) = new_hubs();
+        connect_hubs(&mut hub1, &mut hub2);
+        b.iter(|| encrypt_and_decrypt_with_hubs(&mut hub1, &mut hub2, &file_bytes));
     }
 }
