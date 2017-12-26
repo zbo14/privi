@@ -1,9 +1,9 @@
-#![feature(test)]
+// #![feature(test)]
 
 extern crate bufstream;
 extern crate byteorder;
 extern crate sodiumoxide;
-extern crate test;
+// extern crate test;
 
 use std::clone::Clone;
 use std::collections::HashMap;
@@ -136,7 +136,7 @@ pub fn header(chunk_size: u32, file_size: u32, mime: String) -> Header {
     let (encrypted_body_size, frame_size, num_frames) = encrypted_body_size(chunk_size, file_size);
     Header{
         encrypted_body_size,
-        frame_size,     
+        frame_size, 
         mime,
         num_frames,
     }
@@ -145,13 +145,20 @@ pub fn header(chunk_size: u32, file_size: u32, mime: String) -> Header {
 #[derive(Clone,Debug)]
 pub struct Pipe<C: Clone + Read + Write> {
     cipher: C,
+    decrypt_nonce: secretbox::Nonce,
+    encrypt_nonce: secretbox::Nonce,
+    first_decrypt_nonce: secretbox::Nonce,
+    first_encrypt_nonce: secretbox::Nonce,
     key: secretbox::Key,
-    nonce: secretbox::Nonce,
 }
 
 impl<C: Clone + Read + Write> PartialEq for Pipe<C> {
     fn eq(&self, other: &Self) -> bool {
-        self.key == other.key && self.nonce == other.nonce
+        self.decrypt_nonce == other.encrypt_nonce &&
+        self.encrypt_nonce == other.decrypt_nonce &&
+        self.first_decrypt_nonce == other.first_encrypt_nonce &&
+        self.first_encrypt_nonce == other.first_decrypt_nonce &&
+        self.key == other.key
     }
 }
 
@@ -175,22 +182,32 @@ impl<C: Clone + Read + Write> Write for Pipe<C> {
 impl<C: Clone + Read + Write> Pipe<C> {
     
     pub fn new(cipher: C) -> Pipe<C> {
+        let decrypt_nonce = secretbox::gen_nonce();
+        let encrypt_nonce = secretbox::gen_nonce();
+        let first_decrypt_nonce = decrypt_nonce.clone();
+        let first_encrypt_nonce = encrypt_nonce.clone();
         let key = secretbox::gen_key();
-        let nonce = secretbox::gen_nonce();
         Pipe{
             cipher,
+            decrypt_nonce,
+            encrypt_nonce,
+            first_decrypt_nonce,
+            first_encrypt_nonce,
             key,
-            nonce,
         }
     }
 
     pub fn decrypt<W: Write>(&mut self, w: &mut W) -> Result<Header,String> {
-        let header = Header::decrypt(&self.key, &self.nonce, &mut self.cipher).map_err(|err| err.to_string())?;
+        self.decrypt_nonce.increment_le_inplace();
+        if self.decrypt_nonce == self.first_decrypt_nonce {
+            return Err("Cannot decrypt with pipe anymore".to_owned())
+        }
+        let header = Header::decrypt(&self.key, &self.decrypt_nonce, &mut self.cipher).map_err(|err| err.to_string())?;
         let mut frame = vec![0u8; header.frame_size as usize];
         let mut size_left = header.encrypted_body_size;
         while size_left > header.frame_size {
             self.read_exact(&mut frame).map_err(|err| err.to_string())?;
-            let chunk = &secretbox::open(&frame, &self.nonce, &self.key).unwrap();
+            let chunk = &secretbox::open(&frame, &self.decrypt_nonce, &self.key).unwrap();
             w.write_all(&chunk).map_err(|err| err.to_string())?;
             size_left -= header.frame_size;
         }
@@ -199,28 +216,26 @@ impl<C: Clone + Read + Write> Pipe<C> {
                 frame.truncate(size_left as usize);
             }
             self.read_exact(&mut frame).map_err(|err| err.to_string())?;
-            let chunk = secretbox::open(&frame, &self.nonce, &self.key).unwrap();
+            let chunk = secretbox::open(&frame, &self.decrypt_nonce, &self.key).unwrap();
             w.write_all(&chunk).map_err(|err| err.to_string())?;
         }
         self.flush().map_err(|err| err.to_string())?;
         Ok(header)
     }
 
-    pub fn decrypt_self(&mut self) -> Result<Header,String> {
-        let mut w = self.cipher.clone();
-        let header = self.decrypt(&mut w)?;
-        self.cipher = w;
-        Ok(header)
-    }
-
     pub fn encrypt<R: Read>(&mut self, chunk_size: u32, file_size: u32, mime: String, r: &mut R) -> Result<Header,String> {
+        self.encrypt_nonce.increment_le_inplace();
+        if self.encrypt_nonce == self.first_encrypt_nonce {
+            println!("HERE");
+            return Err("Cannot encrypt with pipe anymore".to_owned())
+        }
         let mut chunk = vec![0u8; chunk_size as usize];
         let header = header(chunk_size, file_size, mime);
         let mut size_left = file_size;
-        header.encrypt(&self.key, &self.nonce, &mut self.cipher).map_err(|err| err.to_string())?;
+        header.encrypt(&self.key, &self.encrypt_nonce, &mut self.cipher).map_err(|err| err.to_string())?;
         while size_left > chunk_size {
             r.read_exact(&mut chunk).map_err(|err| err.to_string())?;
-            let frame = secretbox::seal(&chunk, &self.nonce, &self.key);
+            let frame = secretbox::seal(&chunk, &self.encrypt_nonce, &self.key);
             self.write_all(&frame).map_err(|err| err.to_string())?;
             size_left -= chunk_size;
         } 
@@ -229,16 +244,11 @@ impl<C: Clone + Read + Write> Pipe<C> {
                 chunk.truncate(size_left as usize);
             }
             r.read_exact(&mut chunk).map_err(|err| err.to_string())?;
-            let frame = secretbox::seal(&chunk, &self.nonce, &self.key);
+            let frame = secretbox::seal(&chunk, &self.encrypt_nonce, &self.key);
             self.write_all(&frame).map_err(|err| err.to_string())?;
         }
         self.flush().map_err(|err| err.to_string())?;
         Ok(header)
-    }
-
-    pub fn encrypt_self(&mut self,  chunk_size: u32, file_size: u32, mime: String) -> Result<Header,String> {
-        let mut r = self.cipher.clone();
-        self.encrypt(chunk_size, file_size, mime, &mut r)
     }
 }
 
@@ -251,7 +261,6 @@ pub struct Job{
 
 #[derive(Debug)]
 pub struct Conn {
-    nonce: box_::Nonce,
     pipe: Pipe<BufTcpStream>,
     pre_key: box_::PrecomputedKey,
     recv_buf: Arc<Mutex<Cursor<Vec<u8>>>>,
@@ -260,7 +269,6 @@ pub struct Conn {
 
 impl PartialEq for Conn {
     fn eq(&self, other: &Self) -> bool {
-        self.nonce == other.nonce &&
         self.pipe == other.pipe &&
         self.pre_key == other.pre_key
     }
@@ -300,12 +308,11 @@ impl Conn {
         Ok(plain_bytes)
     }
 
-    fn new(nonce: box_::Nonce, pipe: Pipe<BufTcpStream>, pub_key: &box_::PublicKey, sec_key: &box_::SecretKey) -> Conn {
+    fn new(pipe: Pipe<BufTcpStream>, pub_key: &box_::PublicKey, sec_key: &box_::SecretKey) -> Conn {
         let pre_key = box_::precompute(pub_key, sec_key);
         let recv_buf = Arc::new(Mutex::new(Cursor::new(Vec::new())));
         let send_buf = Arc::new(Mutex::new(Cursor::new(Vec::new())));
         Conn{
-            nonce,
             pipe,
             pre_key,
             recv_buf,
@@ -313,24 +320,28 @@ impl Conn {
         }
     }
 
-    fn connect(&mut self, alias: &str) -> Result<(),String> {
+    fn connect(&mut self, alias: &str, nonce: &box_::Nonce) -> Result<(),String> {
         let mut handshake = self.pipe.key.0.to_vec();
-        handshake.extend_from_slice(&self.pipe.nonce.0);
+        handshake.extend_from_slice(&self.pipe.encrypt_nonce.0);
+        handshake.extend_from_slice(&self.pipe.decrypt_nonce.0);
         handshake.extend_from_slice(alias.as_bytes());
-        let handshake = box_::seal_precomputed(&handshake, &self.nonce, &self.pre_key);
+        let handshake = box_::seal_precomputed(&handshake, nonce, &self.pre_key);
         self.write_u32::<BigEndian>(handshake.len() as u32).map_err(|err| err.to_string())?;
         self.write_all(&handshake).map_err(|err| err.to_string())?;
         self.flush().map_err(|err| err.to_string())
     }
 
-    fn accept(&mut self) -> Result<String,String> {
+    fn accept(&mut self, nonce: &box_::Nonce) -> Result<String,String> {
         let handshake_size = self.read_u32::<BigEndian>().map_err(|err| err.to_string())?;
         let mut handshake = vec![0u8; handshake_size as usize];
         self.read_exact(&mut handshake).map_err(|err| err.to_string())?;
-        let handshake = box_::open_precomputed(&handshake, &self.nonce, &self.pre_key).unwrap();
+        let handshake = box_::open_precomputed(&handshake, nonce, &self.pre_key).unwrap();
         self.pipe.key = secretbox::Key::from_slice(&handshake[..secretbox::KEYBYTES]).unwrap();
-        self.pipe.nonce = secretbox::Nonce::from_slice(&handshake[secretbox::KEYBYTES..secretbox::KEYBYTES+secretbox::NONCEBYTES]).unwrap();
-        let alias = String::from_utf8(handshake[secretbox::KEYBYTES+secretbox::NONCEBYTES..].to_vec()).map_err(|err| err.to_string())?;
+        self.pipe.decrypt_nonce = secretbox::Nonce::from_slice(&handshake[secretbox::KEYBYTES..secretbox::KEYBYTES+secretbox::NONCEBYTES]).unwrap();
+        self.pipe.encrypt_nonce = secretbox::Nonce::from_slice(&handshake[secretbox::KEYBYTES+secretbox::NONCEBYTES..secretbox::KEYBYTES+2*secretbox::NONCEBYTES]).unwrap();
+        self.pipe.first_decrypt_nonce = self.pipe.decrypt_nonce.clone();
+        self.pipe.first_encrypt_nonce = self.pipe.encrypt_nonce.clone();
+        let alias = String::from_utf8(handshake[secretbox::KEYBYTES+2*secretbox::NONCEBYTES..].to_vec()).map_err(|err| err.to_string())?;
         Ok(alias)
     } 
 
@@ -458,8 +469,8 @@ impl Hub {
             return Err(format!("Hub already has conn with alias='{}'", alias_))
         }
         let pipe = Pipe::new(stream);
-        let mut conn = Conn::new(nonce, pipe, &pub_key, &sec_key);
-        conn.connect(alias)?;
+        let mut conn = Conn::new(pipe, &pub_key, &sec_key);
+        conn.connect(alias, &nonce)?;
         let (txd, txe) = conn.run();
         let conn = Conn_{conn, txd, txe};
         conns.insert(alias_, conn);
@@ -467,6 +478,7 @@ impl Hub {
     }
 
     pub fn connect(&mut self, addr: &str) -> Result<(),String> {
+        self.nonce.increment_le_inplace();
         let stream = TcpStream::connect(addr).map_err(|err| err.to_string())?;
         let mut stream = BufTcpStream::new(stream);
         let mut pub_key = vec![0u8; box_::PUBLICKEYBYTES];
@@ -480,8 +492,8 @@ impl Hub {
         stream.write_all(&handshake).map_err(|err| err.to_string())?;
         stream.flush().map_err(|err| err.to_string())?;
         let pipe = Pipe::new(stream);
-        let mut conn = Conn::new(self.nonce.clone(), pipe, &pub_key, &self.sec_key);
-        let alias = conn.accept()?;
+        let mut conn = Conn::new(pipe, &pub_key, &self.sec_key);
+        let alias = conn.accept(&self.nonce)?;
         let mut conns = self.conns.lock().unwrap();
         if conns.contains_key(&alias) {
             return Err(format!("Hub already has conn with alias='{}'", alias))
@@ -514,6 +526,8 @@ mod example {
         // new pipe
         let cipher = Cursor::new(Vec::new());
         let mut pipe = Pipe::new(cipher);
+        pipe.encrypt_nonce = pipe.decrypt_nonce;
+        pipe.first_encrypt_nonce = pipe.first_decrypt_nonce;
 
         // encrypt 
         pipe.encrypt(DEFAULT_CHUNK_SIZE, file_size, mime, &mut plain_bytes.as_slice()).unwrap();
@@ -543,13 +557,13 @@ mod example {
         // create conns
         let pipe1 = Pipe::new(BufTcpStream::new(stream1));
         let pipe2 = Pipe::new(BufTcpStream::new(stream2));
-        let mut conn1 = Conn::new(nonce, pipe1, &pk2, &sk1);
-        let mut conn2 = Conn::new(nonce, pipe2, &pk1, &sk2);
+        let mut conn1 = Conn::new(pipe1, &pk2, &sk1);
+        let mut conn2 = Conn::new(pipe2, &pk1, &sk2);
 
         // connect conns
         let alias = "conn1".to_owned();
-        conn1.connect(&alias).unwrap();
-        conn2.accept().unwrap();
+        conn1.connect(&alias, &nonce).unwrap();
+        conn2.accept(&nonce).unwrap();
 
         // run conns
         let (_, txe) = conn1.run();
@@ -612,7 +626,7 @@ mod tests {
     use std::fs::File;
     use std::net::{TcpListener,TcpStream};
     use std::thread;
-    use self::test::Bencher;
+    // use self::test::Bencher;
 
     const ALTERNATE_CHUNK_SIZE : u32 = 32768;
 
@@ -649,12 +663,10 @@ mod tests {
 
     fn new_pipe() -> Pipe<Cursor<Vec<u8>>> {
         let cipher = Cursor::new(Vec::new());
-        Pipe::new(cipher)
-    }
-
-    fn total_encrypted_size(chunk_size: u32, file_size: u32, mime: String) -> u32 {
-        let header = header(chunk_size, file_size, mime);
-        header.encrypted_header_size() as u32 + header.encrypted_body_size
+        let mut pipe = Pipe::new(cipher);
+        pipe.encrypt_nonce = pipe.decrypt_nonce;
+        pipe.first_encrypt_nonce = pipe.first_decrypt_nonce;
+        pipe 
     }
 
     fn encrypt_and_decrypt_with_pipe(chunk_size: u32, file_bytes: &Vec<u8>, file_size: u32, pipe: &mut Pipe<Cursor<Vec<u8>>>) -> (Header,Vec<u8>) {
@@ -674,35 +686,15 @@ mod tests {
         assert_eq!(expected, actual);
     }
 
-    fn check_headers(actual1: Header, actual2: Header, chunk_size1: u32, chunk_size2: u32, file_size: u32) {
-        check_header(actual1, chunk_size1, file_size);
-        let encrypted_size = total_encrypted_size(chunk_size1, file_size, mime());
-        let expected2 = header(chunk_size2, encrypted_size, String::new());
-        assert_eq!(expected2, actual2);
-    }
-
     fn check_decrypted_bytes(file_bytes: &[u8], decrypted_bytes: &[u8]) {
         assert_eq!(file_bytes, decrypted_bytes);
     }
 
-    fn encrypt2x_and_decrypt2x_with_pipe(chunk_size1: u32, chunk_size2: u32, file_bytes: &Vec<u8>, file_size: u32, pipe: &mut Pipe<Cursor<Vec<u8>>>) -> (Header,Header,Vec<u8>) {
-
-        let encrypted_size = total_encrypted_size(chunk_size1, file_size, mime());
-
-        pipe.encrypt(chunk_size1, file_size, mime(), &mut file_bytes.as_slice()).unwrap();
-        pipe.cipher.set_position(0); 
-        
-        pipe.encrypt_self(chunk_size2, encrypted_size, String::new()).unwrap();
-        pipe.cipher.set_position(0);
-
-        let header2 = pipe.decrypt_self().unwrap();
-        pipe.cipher.set_position(0);
-
-        let mut decrypted_bytes = Vec::new();
-        let header1 = pipe.decrypt(&mut decrypted_bytes).unwrap();
-        pipe.cipher.set_position(0);
-
-        (header1,header2,decrypted_bytes)
+    fn check_pipe_nonces(pipe: &mut Pipe<Cursor<Vec<u8>>>, decrypt_nonce: &mut secretbox::Nonce, encrypt_nonce: &mut secretbox::Nonce) {
+        decrypt_nonce.increment_le_inplace();
+        encrypt_nonce.increment_le_inplace();
+        assert_eq!(decrypt_nonce, &mut pipe.decrypt_nonce);
+        assert_eq!(encrypt_nonce, &mut pipe.encrypt_nonce);
     }
 
     fn new_conns() -> (Conn,Conn) {
@@ -716,27 +708,28 @@ mod tests {
         let (stream1, _) = listener.accept().unwrap();
         let stream2 = handle.join().unwrap();
 
-        let nonce = box_::gen_nonce();
         let (pk1, sk1) = box_::gen_keypair();
         let (pk2, sk2) = box_::gen_keypair();
 
         let cipher1 = BufTcpStream::new(stream1);
         let pipe1 = Pipe::new(cipher1);
-        let conn1 = Conn::new(nonce, pipe1, &pk2, &sk1);
+        let conn1 = Conn::new(pipe1, &pk2, &sk1);
 
         let cipher2 = BufTcpStream::new(stream2);
         let pipe2 = Pipe::new(cipher2);
-        let conn2 = Conn::new(nonce, pipe2, &pk1, &sk2);
+        let conn2 = Conn::new(pipe2, &pk1, &sk2);
 
         (conn1,conn2)
     }
 
-    fn connect_conns(conn1: &mut Conn, conn2: &mut Conn) -> (Sender<()>,Sender<Job>) {
+    fn connect_conns(conn1: &mut Conn, conn2: &mut Conn, nonce: &box_::Nonce) -> (Sender<()>,Sender<Job>) {
 
         let alias = "george_costanza".to_owned();
 
-        conn1.connect(&alias).unwrap();
-        assert_eq!(alias, conn2.accept().unwrap());
+        conn1.connect(&alias, nonce).unwrap();
+        let res = conn2.accept(nonce).unwrap();
+
+        assert_eq!(alias, res);
         assert_eq!(conn1, conn2);
 
         let (_, txe) = conn1.run();
@@ -745,34 +738,24 @@ mod tests {
         (txd, txe)
     }
 
-    fn encrypt_and_decrypt_with_conns(conn1: &mut Conn, conn2: &mut Conn, file_bytes: &Vec<u8>, txd: &Sender<()>, txe: &Sender<Job>) -> Vec<u8> {
-        conn1.encrypt(DEFAULT_CHUNK_SIZE, "audio/mp3".to_owned(), &mut file_bytes.as_slice(), txe).unwrap();
+    fn encrypt_and_decrypt_with_conns(conn1: &mut Conn, conn2: &mut Conn, chunk_size: u32, file_bytes: &Vec<u8>, txd: &Sender<()>, txe: &Sender<Job>) -> Vec<u8> {
+        conn1.encrypt(chunk_size, mime(), &mut file_bytes.as_slice(), txe).unwrap();
         conn2.decrypt(txd).unwrap()
     }
 
-    fn new_hubs() -> (Hub,Hub) {
-
-        let (pub_key1, sec_key1) = box_::gen_keypair();
-        let (pub_key2, sec_key2) = box_::gen_keypair();
-
-        let hub1 = Hub::new("127.0.0.1:11111", "hub1", pub_key1, sec_key1);
-        let hub2 = Hub::new("127.0.0.1:22222", "hub2", pub_key2, sec_key2);
-
-        (hub1, hub2)
+    fn new_hub(addr: &str, alias: &str) -> Hub {
+        let (pub_key, sec_key) = box_::gen_keypair();
+        let hub = Hub::new(addr, alias, pub_key, sec_key);
+        hub.run().unwrap();
+        hub
     }
 
     fn connect_hubs(hub1: &mut Hub, hub2: &mut Hub) {
-
-        hub1.run().unwrap();
-        hub2.run().unwrap();
 
         hub1.connect(&hub2.addr).unwrap();
 
         let conns1 = hub1.conns.lock().unwrap();
         let conns2 = hub2.conns.lock().unwrap();
-
-        assert_eq!(1, conns1.len());
-        assert_eq!(1, conns2.len());
 
         let conn1 = conns1.get(&hub2.alias);
         let conn2 = conns2.get(&hub1.alias);
@@ -780,14 +763,19 @@ mod tests {
         assert_eq!(conn1, conn2);
     }
     
-    fn encrypt_and_decrypt_with_hubs(hub1: &mut Hub, hub2: &mut Hub, file_bytes: &Vec<u8>) -> Vec<u8> {
-        hub1.encrypt(&hub2.alias, DEFAULT_CHUNK_SIZE, "audio/mp3".to_owned(), &mut file_bytes.as_slice()).unwrap();
+    fn encrypt_and_decrypt_with_hubs(hub1: &mut Hub, hub2: &mut Hub, chunk_size: u32, file_bytes: &Vec<u8>) -> Vec<u8> {
+        hub1.encrypt(&hub2.alias, chunk_size, mime(), &mut file_bytes.as_slice()).unwrap();
         hub2.decrypt(&hub1.alias).unwrap()
     }
 
     fn try_to_connect_hubs_again(hub1: &mut Hub, hub2: &mut Hub) {
         assert!(hub1.connect(&hub2.addr).is_err());
         assert!(hub2.connect(&hub1.addr).is_err());
+    }
+
+    fn check_hub_nonce(hub: &mut Hub, nonce: &mut box_::Nonce) {
+        nonce.increment_le_inplace();
+        assert_eq!(nonce, &mut hub.nonce);
     }
 
     #[test]
@@ -813,21 +801,18 @@ mod tests {
         let mut pipe = new_pipe();
         let (file_bytes, file_size) = read_file();
 
+        let mut decrypt_nonce = pipe.decrypt_nonce.clone();
+        let mut encrypt_nonce = pipe.encrypt_nonce.clone();
+
         let (header,decrypted_bytes) = encrypt_and_decrypt_with_pipe(DEFAULT_CHUNK_SIZE, &file_bytes, file_size, &mut pipe);
         check_header(header, DEFAULT_CHUNK_SIZE, file_size);
         check_decrypted_bytes(&file_bytes, &decrypted_bytes);
+        check_pipe_nonces(&mut pipe, &mut decrypt_nonce, &mut encrypt_nonce);
 
         let (header,decrypted_bytes) = encrypt_and_decrypt_with_pipe(ALTERNATE_CHUNK_SIZE, &file_bytes, file_size, &mut pipe);
         check_header(header, ALTERNATE_CHUNK_SIZE, file_size);
         check_decrypted_bytes(&file_bytes, &decrypted_bytes);
-
-        let (header1,header2,decrypted_bytes) = encrypt2x_and_decrypt2x_with_pipe(DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE, &file_bytes, file_size, &mut pipe);
-        check_headers(header1, header2, DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE, file_size);
-        check_decrypted_bytes(&file_bytes, &decrypted_bytes);
-
-        let (header1,header2,decrypted_bytes) = encrypt2x_and_decrypt2x_with_pipe(DEFAULT_CHUNK_SIZE, ALTERNATE_CHUNK_SIZE, &file_bytes, file_size, &mut pipe);
-        check_headers(header1, header2, DEFAULT_CHUNK_SIZE, ALTERNATE_CHUNK_SIZE, file_size);
-        check_decrypted_bytes(&file_bytes, &decrypted_bytes);
+        check_pipe_nonces(&mut pipe, &mut decrypt_nonce, &mut encrypt_nonce);
 
         example::pipe();
     }
@@ -837,10 +822,14 @@ mod tests {
 
         let (mut conn1, mut conn2) = new_conns();
         let (file_bytes, _) = read_file();
+        let nonce = box_::gen_nonce();
 
-        let (txd, txe) = connect_conns(&mut conn1, &mut conn2);
+        let (txd, txe) = connect_conns(&mut conn1, &mut conn2, &nonce);
 
-        let decrypted_bytes = encrypt_and_decrypt_with_conns(&mut conn1, &mut conn2, &file_bytes, &txd, &txe);
+        let decrypted_bytes = encrypt_and_decrypt_with_conns(&mut conn1, &mut conn2, DEFAULT_CHUNK_SIZE, &file_bytes, &txd, &txe);
+        check_decrypted_bytes(&file_bytes, &decrypted_bytes);
+
+        let decrypted_bytes = encrypt_and_decrypt_with_conns(&mut conn1, &mut conn2, ALTERNATE_CHUNK_SIZE, &file_bytes, &txd, &txe);
         check_decrypted_bytes(&file_bytes, &decrypted_bytes);
         
         example::conn();
@@ -849,18 +838,32 @@ mod tests {
     #[test]
     fn test_hub() {
 
-        let (mut hub1, mut hub2) = new_hubs();
+        let mut hub1 = new_hub("127.0.0.1:11111", "hub1");
+        let mut hub2 = new_hub("127.0.0.1:22222", "hub2");
+        let mut hub3 = new_hub("127.0.0.1:33333", "hub3");
+
+        let mut nonce = hub1.nonce.clone();
+
         let (file_bytes, _) = read_file();
 
         connect_hubs(&mut hub1, &mut hub2);
+        check_hub_nonce(&mut hub1, &mut nonce);
 
-        let decrypted_bytes = encrypt_and_decrypt_with_hubs(&mut hub1, &mut hub2, &file_bytes);
+        connect_hubs(&mut hub1, &mut hub3);
+        check_hub_nonce(&mut hub1, &mut nonce);
+
+        let decrypted_bytes = encrypt_and_decrypt_with_hubs(&mut hub1, &mut hub2, DEFAULT_CHUNK_SIZE, &file_bytes);
+        check_decrypted_bytes(&file_bytes, &decrypted_bytes);
+
+        let decrypted_bytes = encrypt_and_decrypt_with_hubs(&mut hub1, &mut hub3, ALTERNATE_CHUNK_SIZE, &file_bytes);
         check_decrypted_bytes(&file_bytes, &decrypted_bytes);
 
         try_to_connect_hubs_again(&mut hub1, &mut hub2);
 
         example::hub();
     }
+
+    /*
 
     #[bench]
     fn bench_pipe(b: &mut Bencher) {
@@ -870,18 +873,12 @@ mod tests {
     }
 
     #[bench]
-    fn bench_pipe2x(b: &mut Bencher) {
-        let (file_bytes, file_size) = read_file();
-        let mut pipe = new_pipe();
-        b.iter(|| encrypt2x_and_decrypt2x_with_pipe(DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE, &file_bytes, file_size, &mut pipe));
-    }
-
-    #[bench]
     fn bench_conn(b: &mut Bencher) {
         let (file_bytes, _) = read_file();
         let (mut conn1, mut conn2) = new_conns();
-        let (txd, txe) = connect_conns(&mut conn1, &mut conn2);
-        b.iter(|| encrypt_and_decrypt_with_conns(&mut conn1, &mut conn2, &file_bytes, &txd, &txe));
+        let nonce = box_::gen_nonce();
+        let (txd, txe) = connect_conns(&mut conn1, &mut conn2, &nonce);
+        b.iter(|| encrypt_and_decrypt_with_conns(&mut conn1, &mut conn2, DEFAULT_CHUNK_SIZE, &file_bytes, &txd, &txe));
     }
 
     #[bench]
@@ -889,6 +886,8 @@ mod tests {
         let (file_bytes, _) = read_file();
         let (mut hub1, mut hub2) = new_hubs();
         connect_hubs(&mut hub1, &mut hub2);
-        b.iter(|| encrypt_and_decrypt_with_hubs(&mut hub1, &mut hub2, &file_bytes));
+        b.iter(|| encrypt_and_decrypt_with_hubs(&mut hub1, &mut hub2, DEFAULT_CHUNK_SIZE, &file_bytes));
     }
+
+    */
 }

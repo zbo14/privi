@@ -23,15 +23,16 @@ fn main() {
     // new pipe
     let cipher = Cursor::new(Vec::new());
     let mut pipe = Pipe::new(cipher);
+    pipe.encrypt_nonce = pipe.decrypt_nonce;
+    pipe.first_encrypt_nonce = pipe.first_decrypt_nonce;
 
     // encrypt 
     pipe.encrypt(DEFAULT_CHUNK_SIZE, file_size, mime, &mut plain_bytes.as_slice()).unwrap();
     pipe.cipher.set_position(0);
 
     // decrypt
-    let mut decrypted = Cursor::new(Vec::new());
-    pipe.decrypt(&mut decrypted).unwrap();
-    let decrypted_bytes = decrypted.into_inner();
+    let mut decrypted_bytes = Vec::new();
+    pipe.decrypt(&mut decrypted_bytes).unwrap();
 
     // compare decrypted bytes to plain bytes
     assert_eq!(plain_bytes, decrypted_bytes);
